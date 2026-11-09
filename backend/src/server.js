@@ -342,7 +342,12 @@ async function issueChallenge(user, req, res, status = 200) {
   await saveDb();
   try {
     await deliverOtp(user.email, code);
-  } catch {
+  } catch (error) {
+    console.error("OTP email delivery failed.", {
+      code: typeof error?.code === "string" ? error.code : "UNKNOWN",
+      responseCode: Number.isInteger(error?.responseCode) ? error.responseCode : undefined,
+      command: typeof error?.command === "string" ? error.command : undefined,
+    });
     audit("OTP_SEND_FAILED", user, "Verification email delivery failed for " + user.email + ".", req);
     await saveDb();
     return res.status(503).json({ error: "Could not send the verification email. Check the SMTP settings." });
