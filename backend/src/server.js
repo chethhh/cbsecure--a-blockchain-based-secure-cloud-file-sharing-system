@@ -403,7 +403,7 @@ const allowedOrigins = new Set([
   process.env.NETLIFY_URL,
   "http://localhost:5173",
 ].filter(Boolean).flatMap((value) => value.split(",")).map((value) => value.trim()));
-app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.includes(origin)) }));
+app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.has(origin)) }));
 app.use(express.json({ limit: "1mb" }));
 app.use("/api/auth", rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false }));
 app.use("/api", (req, res, next) => {
