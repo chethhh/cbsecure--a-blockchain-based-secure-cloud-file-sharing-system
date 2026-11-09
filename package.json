@@ -1,0 +1,21 @@
+{
+  "name": "cb-secure",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Client-encrypted decentralized file sharing",
+  "workspaces": ["frontend", "backend"],
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c cyan,green \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "npm --workspace backend run dev",
+    "dev:web": "npm --workspace frontend run dev",
+    "build": "npm --workspace frontend run build",
+    "start": "npm --workspace backend start",
+    "contracts:compile": "npm --prefix contracts run compile",
+    "contracts:node": "npm --prefix contracts run node",
+    "contracts:deploy": "npm --prefix contracts run deploy:local"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
+
