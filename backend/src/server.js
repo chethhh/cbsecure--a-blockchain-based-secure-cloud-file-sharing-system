@@ -22,9 +22,12 @@ import { verifyMessage, getAddress } from "ethers";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const isVercel = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
 const isRender = Boolean(process.env.RENDER || process.env.RENDER_SERVICE_ID);
+const isNetlify = Boolean(process.env.NETLIFY);
+const isServerless = isVercel || isNetlify;
+const privateBlobConfigured = Boolean(process.env.BLOB_STORE_ID && process.env.BLOB_READ_WRITE_TOKEN);
 const dataDir = process.env.CB_SECURE_DATA_DIR
   ? path.resolve(process.env.CB_SECURE_DATA_DIR)
-  : isVercel ? path.join(tmpdir(), "cb-secure-runtime") : path.resolve(here, "../data");
+  : isServerless ? path.join(tmpdir(), "cb-secure-runtime") : path.resolve(here, "../data");
 const storageDir = path.join(dataDir, "storage");
 const incomingDir = path.join(dataDir, "incoming");
 const dbPath = path.join(dataDir, "db.json");
@@ -35,9 +38,9 @@ const initialAdminEmail = String(process.env.INITIAL_ADMIN_EMAIL || "").trim().t
 const googleClientId = String(process.env.GOOGLE_CLIENT_ID || "").trim();
 const googleClient = googleClientId ? new OAuth2Client(googleClientId) : null;
 const smtpConfigured = Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
-const databaseUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL || "";
+const databaseUrl = process.env.NETLIFY_DB_URL || process.env.DATABASE_URL || process.env.POSTGRES_URL || "";
 
-if (!isVercel && jwtSecret.length < 32) throw new Error("Set JWT_SECRET to a random value with at least 32 characters.");
+if (!isServerless && jwtSecret.length < 32) throw new Error("Set JWT_SECRET to a random value with at least 32 characters.");
 await mkdir(storageDir, { recursive: true });
 await mkdir(incomingDir, { recursive: true });
 
@@ -60,7 +63,7 @@ const db = new Proxy(Object.create(null), {
   get: (_target, property) => currentDb()?.[property],
   set: (_target, property, value) => { currentDb()[property] = value; return true; },
 });
-processDb = isVercel ? structuredClone(emptyDb) : await readDb();
+processDb = isServerless ? structuredClone(emptyDb) : await readDb();
 
 function migrateDbState(state) {
   let changed = false;
@@ -76,7 +79,7 @@ function migrateDbState(state) {
   return changed;
 }
 
-if (isVercel && databaseUrl) {
+if (isServerless && databaseUrl) {
   try {
     databasePool = new Pool({ connectionString: databaseUrl, max: 3, connectionTimeoutMillis: 8000, idleTimeoutMillis: 10000 });
     await initializePersistentDatabase();
@@ -88,7 +91,7 @@ if (isVercel && databaseUrl) {
   }
 }
 
-if (!isVercel && migrateDbState(processDb)) await saveDb();
+if (!isServerless && migrateDbState(processDb)) await saveDb();
 
 async function initializePersistentDatabase() {
   const client = await databasePool.connect();
@@ -111,18 +114,18 @@ async function initializePersistentDatabase() {
 }
 
 function deployedConfigurationIssues() {
-  if (!isVercel && !isRender) return [];
+  if (!isServerless && !isRender) return [];
   return [
-    isVercel && !databasePool && (databaseStartupError || "DATABASE_URL"),
+    isServerless && !databasePool && (databaseStartupError || "NETLIFY_DB_URL / DATABASE_URL"),
     jwtSecret.length < 32 && "JWT_SECRET",
     !initialAdminEmail && "INITIAL_ADMIN_EMAIL",
-    isVercel && !smtpConfigured && "SMTP_HOST / SMTP_USER / SMTP_PASS",
-    isVercel && !process.env.BLOB_STORE_ID && !process.env.BLOB_READ_WRITE_TOKEN && "Private Blob storage connection",
+    isServerless && !smtpConfigured && "SMTP_HOST / SMTP_USER / SMTP_PASS",
+    isServerless && !privateBlobConfigured && "Private Blob storage connection",
   ].filter(Boolean);
 }
 
 function persistentDatabaseMiddleware(req, res, next) {
-  if (!isVercel) return next();
+  if (!isServerless) return next();
   if (!databasePool) return res.status(503).json({ error: "The hosted backend needs a persistent database connection.", missing: [databaseStartupError || "DATABASE_URL"] });
   databasePool.connect().then(async (client) => {
     try {
@@ -180,7 +183,7 @@ async function saveDb() {
     await context.client.query("UPDATE cb_secure_app_state SET state = $1::jsonb, updated_at = now() WHERE id = 1", [JSON.stringify(context.db)]);
     return;
   }
-  if (isVercel) throw new Error("The hosted backend cannot save data without its persistent database.");
+  if (isServerless) throw new Error("The hosted backend cannot save data without its persistent database.");
   await writeFile(dbPath, JSON.stringify(processDb, null, 2), "utf8");
 }
 
@@ -301,7 +304,13 @@ const upload = multer({
 
 app.disable("x-powered-by");
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
-const allowedOrigins = (process.env.CORS_ORIGIN || "http://localhost:5173").split(",").map((value) => value.trim());
+const allowedOrigins = new Set([
+  process.env.CORS_ORIGIN,
+  process.env.URL,
+  process.env.DEPLOY_PRIME_URL,
+  process.env.NETLIFY_URL,
+  "http://localhost:5173",
+].filter(Boolean).flatMap((value) => value.split(",")).map((value) => value.trim()));
 app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.includes(origin)) }));
 app.use(express.json({ limit: "1mb" }));
 app.use("/api/auth", rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false }));
@@ -337,9 +346,9 @@ app.get("/api/health", (_req, res) => {
       database: Boolean(databasePool),
       durableMetadata: Boolean(databasePool),
       emailOtp: smtpConfigured,
-      privateBlobStorage: Boolean(process.env.BLOB_STORE_ID || process.env.BLOB_READ_WRITE_TOKEN),
-      directUploads: Boolean(isVercel && (process.env.BLOB_STORE_ID || process.env.BLOB_READ_WRITE_TOKEN)),
-      durableFileStorage: Boolean(process.env.PINATA_JWT || process.env.BLOB_STORE_ID || process.env.BLOB_READ_WRITE_TOKEN),
+      privateBlobStorage: privateBlobConfigured,
+      directUploads: privateBlobConfigured,
+      durableFileStorage: Boolean(process.env.PINATA_JWT || privateBlobConfigured),
       ipfs: Boolean(process.env.PINATA_JWT),
       ethereum: "configure contract address in client",
     },
@@ -564,7 +573,7 @@ async function createBlobUploadTicket(user, metadata, mode, fileId = null) {
 }
 
 app.post("/api/files/upload-ticket", authenticate, async (req, res) => {
-  if (!isVercel || !process.env.BLOB_STORE_ID) return res.status(503).json({ error: "Private Blob storage is not connected to this deployment." });
+  if (!privateBlobConfigured) return res.status(503).json({ error: "Private Blob storage is not connected to this deployment." });
   const metadata = validateUploadMetadata(req.body || {}, "create");
   if (!metadata) return res.status(400).json({ error: "Encrypted file metadata is incomplete or invalid." });
   const ticket = await createBlobUploadTicket(req.user, metadata, "create");
@@ -572,7 +581,7 @@ app.post("/api/files/upload-ticket", authenticate, async (req, res) => {
 });
 
 app.post("/api/files/:id/replace-ticket", authenticate, async (req, res) => {
-  if (!isVercel || !process.env.BLOB_STORE_ID) return res.status(503).json({ error: "Private Blob storage is not connected to this deployment." });
+  if (!privateBlobConfigured) return res.status(503).json({ error: "Private Blob storage is not connected to this deployment." });
   const file = db.files.find((item) => item.id === req.params.id);
   if (!file) return res.status(404).json({ error: "File not found." });
   const writeGrant = db.grants.find((item) => item.fileId === file.id && item.active && item.permissionLevel === 2 && item.recipientAddress?.toLowerCase() === req.user.walletAddress?.toLowerCase());
@@ -585,7 +594,7 @@ app.post("/api/files/:id/replace-ticket", authenticate, async (req, res) => {
 });
 
 app.post("/api/blob/upload", authenticate, async (req, res) => {
-  if (!isVercel || !process.env.BLOB_STORE_ID) return res.status(503).json({ error: "Private Blob storage is not connected to this deployment." });
+  if (!privateBlobConfigured) return res.status(503).json({ error: "Private Blob storage is not connected to this deployment." });
   try {
     const response = await handleUploadPresigned({
       request: req,
@@ -941,7 +950,7 @@ app.post("/api/activity/record", authenticate, async (req, res) => {
 app.get("/api/notifications", authenticate, (req, res) => {
   res.json(db.activity.filter((item) => item.userEmail === req.user.email).slice(0, 20));
 });
-if (process.env.NODE_ENV === "production" && !isVercel) {
+if (process.env.NODE_ENV === "production" && !isServerless) {
   const frontendDist = path.resolve(here, "../../frontend/dist");
   app.use(express.static(frontendDist, { index: false, maxAge: "1h" }));
   app.get("*", (req, res, next) => {
@@ -955,7 +964,6 @@ app.use((error, _req, res, _next) => {
   res.status(500).json({ error: "Unexpected server error." });
 });
 
-if (!isVercel) app.listen(port, "0.0.0.0", () => console.log("CB SECURE service listening on port " + port));
+if (!isServerless) app.listen(port, "0.0.0.0", () => console.log("CB SECURE service listening on port " + port));
 
 export default app;
-

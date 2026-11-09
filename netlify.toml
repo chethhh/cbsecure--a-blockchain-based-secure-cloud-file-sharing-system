@@ -1,0 +1,36 @@
+[build]
+  command = "npm ci --include=dev && npm run build"
+  publish = "frontend/dist"
+  functions = "netlify/functions"
+
+[build.environment]
+  NODE_VERSION = "22"
+
+[functions]
+  node_bundler = "esbuild"
+  external_node_modules = [
+    "@neondatabase/serverless",
+    "@vercel/blob",
+    "bcryptjs",
+    "cors",
+    "ethers",
+    "express",
+    "express-rate-limit",
+    "google-auth-library",
+    "helmet",
+    "jsonwebtoken",
+    "multer",
+    "nodemailer",
+    "serverless-http"
+  ]
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
