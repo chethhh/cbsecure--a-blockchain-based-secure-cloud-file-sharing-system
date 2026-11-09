@@ -320,7 +320,7 @@ function FileTable({ files, busyId, currentUserId, role, onDownload, onShare, on
           return <tr key={file.id}>
             <td><div className="file-name-cell"><span className="file-type-icon">{fileIcon(file.originalName)}</span><span><strong>{file.originalName}</strong><small>{role === "Admin" && !isOwner ? file.ownerEmail : file.ipfsCid.slice(0, 13) + "…"}</small></span></div></td>
             <td className="muted-cell">{formatBytes(file.size)}</td>
-            <td><span className={"storage-pill " + (file.storage === "ipfs" ? "ipfs" : "local")}><span />{file.storage === "ipfs" ? "IPFS" : "Local"}</span></td>
+            <td><span className={"storage-pill " + (file.storage === "ipfs" ? "ipfs" : file.storage === "gcs" || file.storage === "blob" ? "gcs" : "local")}><span />{file.storage === "ipfs" ? "IPFS" : file.storage === "gcs" || file.storage === "blob" ? "Cloud" : "Local"}</span></td>
             <td className="muted-cell">{dateLabel(file.createdAt)}</td>
             <td><span className="integrity-pill"><CheckCircle2 size={13} /> SHA-256</span></td>
             <td><div className="row-actions">
@@ -919,4 +919,3 @@ function PageHeading({ eyebrow, title, description, action }: { eyebrow: string;
 }
 
 export default App;
-

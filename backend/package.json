@@ -8,6 +8,8 @@
     "start": "node src/server.js"
   },
   "dependencies": {
+    "@google-cloud/firestore": "^9.4.0",
+    "@google-cloud/storage": "^8.4.0",
     "@neondatabase/serverless": "^1.2.0",
     "@netlify/database": "^2.0.3",
     "@vercel/blob": "^2.8.2",

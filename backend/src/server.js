@@ -10,6 +10,8 @@ import jwt from "jsonwebtoken";
 import nodemailer from "nodemailer";
 import { OAuth2Client } from "google-auth-library";
 import { Pool } from "@neondatabase/serverless";
+import { Firestore } from "@google-cloud/firestore";
+import { Storage } from "@google-cloud/storage";
 import { del as deleteBlob, head as headBlob, issueSignedToken, presignUrl } from "@vercel/blob";
 import { handleUploadPresigned } from "@vercel/blob/client";
 import { randomInt, createHash, randomUUID } from "node:crypto";
@@ -23,8 +25,14 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const isVercel = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
 const isRender = Boolean(process.env.RENDER || process.env.RENDER_SERVICE_ID);
 const isNetlify = Boolean(process.env.NETLIFY);
-const isServerless = isVercel || isNetlify;
+const isCloudRun = Boolean(process.env.K_SERVICE || process.env.CLOUD_RUN);
+const isFunctionPlatform = isVercel || isNetlify;
+const isServerless = isFunctionPlatform || isCloudRun;
 const privateBlobConfigured = Boolean(process.env.BLOB_STORE_ID && process.env.BLOB_READ_WRITE_TOKEN);
+const storageBucketName = String(process.env.GCS_BUCKET || "").trim();
+const firestore = isCloudRun ? new Firestore({ projectId: process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT }) : null;
+const firestoreStateRef = firestore?.collection("cb_secure").doc("app_state") || null;
+const cloudStorage = isCloudRun && storageBucketName ? new Storage({ projectId: process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT }) : null;
 const dataDir = process.env.CB_SECURE_DATA_DIR
   ? path.resolve(process.env.CB_SECURE_DATA_DIR)
   : isServerless ? path.join(tmpdir(), "cb-secure-runtime") : path.resolve(here, "../data");
@@ -49,6 +57,7 @@ const dbContext = new AsyncLocalStorage();
 let processDb;
 let databasePool = null;
 let databaseStartupError = "";
+let firestoreStartupError = "";
 async function readDb() {
   try {
     return { ...emptyDb, ...JSON.parse(await readFile(dbPath, "utf8")) };
@@ -79,7 +88,7 @@ function migrateDbState(state) {
   return changed;
 }
 
-if (isServerless && databaseUrl) {
+if (isFunctionPlatform && databaseUrl) {
   try {
     databasePool = new Pool({ connectionString: databaseUrl, max: 3, connectionTimeoutMillis: 8000, idleTimeoutMillis: 10000 });
     await initializePersistentDatabase();
@@ -91,7 +100,17 @@ if (isServerless && databaseUrl) {
   }
 }
 
-if (!isServerless && migrateDbState(processDb)) await saveDb();
+if (isCloudRun) {
+  try {
+    const snapshot = await firestoreStateRef.get();
+    if (snapshot.exists) processDb = { ...emptyDb, ...(snapshot.data()?.state || {}) };
+    else await firestoreStateRef.create({ state: emptyDb, updatedAt: new Date().toISOString() });
+    if (migrateDbState(processDb)) await firestoreStateRef.set({ state: processDb, updatedAt: new Date().toISOString() });
+  } catch (error) {
+    firestoreStartupError = "Firestore connection failed.";
+    console.error(firestoreStartupError, error instanceof Error ? error.message : "Unknown database error");
+  }
+} else if (!isServerless && migrateDbState(processDb)) await saveDb();
 
 async function initializePersistentDatabase() {
   const client = await databasePool.connect();
@@ -116,16 +135,70 @@ async function initializePersistentDatabase() {
 function deployedConfigurationIssues() {
   if (!isServerless && !isRender) return [];
   return [
-    isServerless && !databasePool && (databaseStartupError || "NETLIFY_DB_URL / DATABASE_URL"),
+    isFunctionPlatform && !databasePool && (databaseStartupError || "NETLIFY_DB_URL / DATABASE_URL"),
+    isCloudRun && firestoreStartupError,
+    isCloudRun && !firestoreStateRef && "Firestore database",
     jwtSecret.length < 32 && "JWT_SECRET",
     !initialAdminEmail && "INITIAL_ADMIN_EMAIL",
     isServerless && !smtpConfigured && "SMTP_HOST / SMTP_USER / SMTP_PASS",
-    isServerless && !privateBlobConfigured && "Private Blob storage connection",
+    isFunctionPlatform && !privateBlobConfigured && "Private Blob storage connection",
+    isCloudRun && !cloudStorage && "GCS_BUCKET",
   ].filter(Boolean);
 }
 
+let firestoreRequestQueue = Promise.resolve();
+async function firestoreRequestMiddleware(req, res, next) {
+  let release;
+  const previous = firestoreRequestQueue;
+  firestoreRequestQueue = new Promise((resolve) => { release = resolve; });
+  await previous;
+  try {
+    const snapshot = await firestoreStateRef.get();
+    const requestDb = { ...emptyDb, ...(snapshot.data()?.state || {}) };
+    const context = { db: requestDb, firestore: true, dirty: false, finishPromise: null, afterCommit: [] };
+    const finish = (commit) => {
+      if (!context.finishPromise) {
+        context.finishPromise = (async () => {
+          try {
+            if (commit && context.dirty) {
+              await firestoreStateRef.set({ state: context.db, updatedAt: new Date().toISOString() });
+              processDb = context.db;
+              for (const task of context.afterCommit) {
+                try { await task(); }
+                catch (error) { console.error("Post-commit storage cleanup failed.", error instanceof Error ? error.message : "Unknown error"); }
+              }
+            }
+          } finally { release(); }
+        })();
+      }
+      return context.finishPromise;
+    };
+    const originalEnd = res.end.bind(res);
+    res.end = (...args) => {
+      void finish(res.statusCode < 500).then(
+        () => originalEnd(...args),
+        () => {
+          if (!res.headersSent) {
+            res.statusCode = 503;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            originalEnd(JSON.stringify({ error: "The hosted database could not save this request." }));
+          } else originalEnd(...args);
+        },
+      );
+      return res;
+    };
+    req.on("aborted", () => { void finish(false); });
+    res.on("close", () => { if (!res.writableFinished) void finish(false); });
+    dbContext.run(context, next);
+  } catch (error) {
+    release();
+    next(error);
+  }
+}
+
 function persistentDatabaseMiddleware(req, res, next) {
-  if (!isServerless) return next();
+  if (isCloudRun) return firestoreStartupError ? res.status(503).json({ error: "The hosted backend needs a persistent database connection.", missing: [firestoreStartupError] }) : firestoreRequestMiddleware(req, res, next);
+  if (!isFunctionPlatform) return next();
   if (!databasePool) return res.status(503).json({ error: "The hosted backend needs a persistent database connection.", missing: [databaseStartupError || "DATABASE_URL"] });
   databasePool.connect().then(async (client) => {
     try {
@@ -179,6 +252,10 @@ function persistentDatabaseMiddleware(req, res, next) {
 
 async function saveDb() {
   const context = dbContext.getStore();
+  if (context?.firestore) {
+    context.dirty = true;
+    return;
+  }
   if (context?.client) {
     await context.client.query("UPDATE cb_secure_app_state SET state = $1::jsonb, updated_at = now() WHERE id = 1", [JSON.stringify(context.db)]);
     return;
@@ -299,8 +376,23 @@ function requireRole(...roles) {
 
 const upload = multer({
   dest: incomingDir,
-  limits: { fileSize: 100 * 1024 * 1024, files: 1, fields: 8, parts: 9, fieldSize: 4096 },
+  limits: { fileSize: isCloudRun ? 30 * 1024 * 1024 : 100 * 1024 * 1024, files: 1, fields: 8, parts: 9, fieldSize: 4096 },
 });
+
+async function saveCloudStorageObject(ownerId, bytes, digest) {
+  const objectName = "cb-secure/" + ownerId + "/" + digest + ".bin";
+  await cloudStorage.bucket(storageBucketName).file(objectName).save(bytes, {
+    resumable: false,
+    contentType: "application/octet-stream",
+    metadata: { metadata: { ownerId, sha256: digest } },
+  });
+  return "gcs:" + objectName;
+}
+
+async function deleteCloudStorageObject(storageReference) {
+  if (!cloudStorage || !storageReference?.startsWith("gcs:")) return;
+  await cloudStorage.bucket(storageBucketName).file(storageReference.slice("gcs:".length)).delete({ ignoreNotFound: true });
+}
 
 app.disable("x-powered-by");
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
@@ -725,6 +817,11 @@ app.post("/api/files/upload", authenticate, upload.single("ciphertext"), async (
       if (!pinResponse.ok) throw new Error("IPFS pin request failed.");
       cid = (await pinResponse.json()).IpfsHash;
       await unlink(req.file.path);
+    } else if (isCloudRun && cloudStorage) {
+      const bytes = await readFile(req.file.path);
+      const digest = createHash("sha256").update(bytes).digest("hex");
+      cid = await saveCloudStorageObject(req.user.id, bytes, digest);
+      await unlink(req.file.path);
     } else {
       const digest = createHash("sha256").update(await readFile(req.file.path)).digest("hex");
       cid = "local-" + digest;
@@ -748,7 +845,7 @@ app.post("/api/files/upload", authenticate, upload.single("ciphertext"), async (
     wrappedKey: String(wrappedKey),
     wrapIv: String(wrapIv),
     salt: String(salt),
-    storage: process.env.PINATA_JWT ? "ipfs" : "local",
+    storage: process.env.PINATA_JWT ? "ipfs" : isCloudRun && cloudStorage ? "gcs" : "local",
     ownerId: req.user.id,
     ownerEmail: req.user.email,
     ownerWallet: req.user.walletAddress,
@@ -810,7 +907,7 @@ app.put("/api/files/:id/replace", authenticate, upload.single("ciphertext"), asy
   }
 
   let cid;
-  const storage = process.env.PINATA_JWT ? "ipfs" : "local";
+  const storage = process.env.PINATA_JWT ? "ipfs" : isCloudRun && cloudStorage ? "gcs" : "local";
   try {
     if (process.env.PINATA_JWT) {
       const form = new FormData();
@@ -818,6 +915,11 @@ app.put("/api/files/:id/replace", authenticate, upload.single("ciphertext"), asy
       const pinResponse = await fetch("https://api.pinata.cloud/pinning/pinFileToIPFS", { method: "POST", headers: { Authorization: "Bearer " + process.env.PINATA_JWT }, body: form });
       if (!pinResponse.ok) throw new Error("IPFS pin request failed.");
       cid = (await pinResponse.json()).IpfsHash;
+      await unlink(req.file.path);
+    } else if (storage === "gcs") {
+      const bytes = await readFile(req.file.path);
+      const digest = createHash("sha256").update(bytes).digest("hex");
+      cid = await saveCloudStorageObject(req.user.id, bytes, digest);
       await unlink(req.file.path);
     } else {
       const digest = createHash("sha256").update(await readFile(req.file.path)).digest("hex");
@@ -831,6 +933,7 @@ app.put("/api/files/:id/replace", authenticate, upload.single("ciphertext"), asy
   }
 
   const oldCid = file.ipfsCid;
+  const oldStorage = file.storage;
   file.ipfsCid = cid;
   file.storage = storage;
   file.originalName = originalName;
@@ -844,6 +947,10 @@ app.put("/api/files/:id/replace", authenticate, upload.single("ciphertext"), asy
   }
   audit("FILE_CONTENT_REPLACED", req.user, "Updated encrypted content for " + file.originalName + ".", req);
   await saveDb();
+  if (oldStorage === "gcs" && oldCid !== cid && !db.files.some((item) => item.id !== file.id && item.storage === "gcs" && item.ipfsCid === oldCid)) {
+    if (res.locals.afterDatabaseCommit) res.locals.afterDatabaseCommit(() => deleteCloudStorageObject(oldCid));
+    else await deleteCloudStorageObject(oldCid).catch(() => {});
+  }
   res.json({ file });
 });
 app.get("/api/files/shared", authenticate, (req, res) => {
@@ -882,6 +989,16 @@ app.get("/api/files/:id/download", authenticate, async (req, res) => {
   }
   if (file.storage === "ipfs") {
     return res.redirect("https://gateway.pinata.cloud/ipfs/" + encodeURIComponent(file.ipfsCid));
+  }
+  if (file.storage === "gcs" && file.ipfsCid?.startsWith("gcs:")) {
+    res.setHeader("Content-Type", "application/octet-stream");
+    res.setHeader("Content-Disposition", "attachment; filename=\"ciphertext.bin\"");
+    const stream = cloudStorage.bucket(storageBucketName).file(file.ipfsCid.slice("gcs:".length)).createReadStream();
+    stream.on("error", () => {
+      if (!res.headersSent) res.status(404).json({ error: "Encrypted file bytes were not found." });
+      else res.destroy();
+    });
+    return stream.pipe(res);
   }
   const digest = file.ipfsCid.replace(/^local-/, "");
   res.setHeader("Content-Type", "application/octet-stream");
@@ -950,7 +1067,7 @@ app.post("/api/activity/record", authenticate, async (req, res) => {
 app.get("/api/notifications", authenticate, (req, res) => {
   res.json(db.activity.filter((item) => item.userEmail === req.user.email).slice(0, 20));
 });
-if (process.env.NODE_ENV === "production" && !isServerless) {
+if (process.env.NODE_ENV === "production" && !isFunctionPlatform) {
   const frontendDist = path.resolve(here, "../../frontend/dist");
   app.use(express.static(frontendDist, { index: false, maxAge: "1h" }));
   app.get("*", (req, res, next) => {
@@ -959,11 +1076,11 @@ if (process.env.NODE_ENV === "production" && !isServerless) {
   });
 }
 app.use((error, _req, res, _next) => {
-  if (error instanceof multer.MulterError) return res.status(413).json({ error: "Upload exceeds the 100 MB file limit." });
+  if (error instanceof multer.MulterError) return res.status(413).json({ error: isCloudRun ? "Upload exceeds the 30 MB Cloud Run file limit." : "Upload exceeds the 100 MB file limit." });
   console.error("CB SECURE request failed.", error instanceof Error ? error.message : "Unknown error");
   res.status(500).json({ error: "Unexpected server error." });
 });
 
-if (!isServerless) app.listen(port, "0.0.0.0", () => console.log("CB SECURE service listening on port " + port));
+if (!isFunctionPlatform) app.listen(port, "0.0.0.0", () => console.log("CB SECURE service listening on port " + port));
 
 export default app;

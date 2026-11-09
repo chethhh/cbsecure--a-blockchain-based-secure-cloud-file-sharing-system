@@ -18,7 +18,7 @@ export type FileRecord = {
   wrappedKey: string;
   wrapIv: string;
   salt: string;
-  storage: "local" | "ipfs";
+  storage: "local" | "ipfs" | "blob" | "gcs";
   ownerId: string;
   ownerEmail: string;
   ownerWallet: string | null;
@@ -134,4 +134,3 @@ export type ActivityItem = {
   timestamp: string;
   walletAddress: string | null;
 };
-

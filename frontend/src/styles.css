@@ -318,6 +318,7 @@ kbd { flex: 0 0 auto; padding: 2px 4px; color: #777b83; border: 1px solid rgba(2
 .storage-pill { display: inline-flex; align-items: center; gap: 5px; padding: 4px 6px; border: 1px solid rgba(255,255,255,.07); border-radius: 5px; color: #999ea4; font-family: "DM Mono",monospace; font-size: 12px; }
 .storage-pill > span { width: 4px; height: 4px; border-radius: 50%; background: #82c9e8; }
 .storage-pill.local > span { background: #bcacff; }
+.storage-pill.gcs > span { background: #75d9c0; }
 .integrity-pill { display: inline-flex; align-items: center; gap: 5px; color: #8bd7b3; font-family: "DM Mono",monospace; font-size: 12px; }
 .row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 2px; }
 .row-actions .icon-button { width: 27px; height: 27px; }
