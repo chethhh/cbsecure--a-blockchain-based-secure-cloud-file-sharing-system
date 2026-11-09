@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { AsyncLocalStorage } from "node:async_hooks";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -8,20 +9,25 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import nodemailer from "nodemailer";
 import { OAuth2Client } from "google-auth-library";
+import { Pool } from "@neondatabase/serverless";
+import { del as deleteBlob, head as headBlob, issueSignedToken, presignUrl } from "@vercel/blob";
+import { handleUploadPresigned } from "@vercel/blob/client";
 import { randomInt, createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile, unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { verifyMessage, getAddress } from "ethers";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const isVercel = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
+const isRender = Boolean(process.env.RENDER || process.env.RENDER_SERVICE_ID);
 const dataDir = process.env.CB_SECURE_DATA_DIR
   ? path.resolve(process.env.CB_SECURE_DATA_DIR)
-  : path.resolve(here, "../data");
+  : isVercel ? path.join(tmpdir(), "cb-secure-runtime") : path.resolve(here, "../data");
 const storageDir = path.join(dataDir, "storage");
 const incomingDir = path.join(dataDir, "incoming");
 const dbPath = path.join(dataDir, "db.json");
-const frontendDist = path.resolve(here, "../../frontend/dist");
 const app = express();
 const port = Number(process.env.PORT || 3000);
 const jwtSecret = process.env.JWT_SECRET || "";
@@ -29,18 +35,17 @@ const initialAdminEmail = String(process.env.INITIAL_ADMIN_EMAIL || "").trim().t
 const googleClientId = String(process.env.GOOGLE_CLIENT_ID || "").trim();
 const googleClient = googleClientId ? new OAuth2Client(googleClientId) : null;
 const smtpConfigured = Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+const databaseUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL || "";
 
-if (jwtSecret.length < 32) throw new Error("Set JWT_SECRET to a random value with at least 32 characters.");
-if (process.env.NODE_ENV === "production" && !initialAdminEmail) {
-  throw new Error("Set INITIAL_ADMIN_EMAIL to the email address that should become the first Admin.");
-}
-if (process.env.NODE_ENV === "production" && !smtpConfigured) {
-  throw new Error("Configure SMTP_HOST, SMTP_USER, and SMTP_PASS before starting in production.");
-}
+if (!isVercel && jwtSecret.length < 32) throw new Error("Set JWT_SECRET to a random value with at least 32 characters.");
 await mkdir(storageDir, { recursive: true });
 await mkdir(incomingDir, { recursive: true });
 
-const emptyDb = { users: [], files: [], grants: [], activity: [], challenges: [], walletNonces: [] };
+const emptyDb = { users: [], files: [], grants: [], activity: [], challenges: [], walletNonces: [], pendingUploads: [] };
+const dbContext = new AsyncLocalStorage();
+let processDb;
+let databasePool = null;
+let databaseStartupError = "";
 async function readDb() {
   try {
     return { ...emptyDb, ...JSON.parse(await readFile(dbPath, "utf8")) };
@@ -48,30 +53,140 @@ async function readDb() {
     return structuredClone(emptyDb);
   }
 }
-let db = await readDb();
-let dbChanged = false;
-for (const user of db.users) {
-  if (user.role === "Viewer") {
-    user.role = "Reader";
-    dbChanged = true;
-  }
-  if (restoreLocalFiles(user)) dbChanged = true;
+function currentDb() {
+  return dbContext.getStore()?.db || processDb;
 }
-if (initialAdminEmail && !db.users.some((user) => user.role === "Admin")) {
-  const bootstrapAdmin = db.users.find((user) => user.email === initialAdminEmail);
-  if (bootstrapAdmin) {
-    bootstrapAdmin.role = "Admin";
-    dbChanged = true;
+const db = new Proxy(Object.create(null), {
+  get: (_target, property) => currentDb()?.[property],
+  set: (_target, property, value) => { currentDb()[property] = value; return true; },
+});
+processDb = isVercel ? structuredClone(emptyDb) : await readDb();
+
+function migrateDbState(state) {
+  let changed = false;
+  state.pendingUploads ||= [];
+  for (const user of state.users) {
+    if (user.role === "Viewer") { user.role = "Reader"; changed = true; }
+    if (restoreLocalFiles(user, state)) changed = true;
   }
-}
-if (dbChanged) await saveDb();
-async function saveDb() {
-  await writeFile(dbPath, JSON.stringify(db, null, 2), "utf8");
+  if (initialAdminEmail && !state.users.some((user) => user.role === "Admin")) {
+    const bootstrapAdmin = state.users.find((user) => user.email === initialAdminEmail);
+    if (bootstrapAdmin) { bootstrapAdmin.role = "Admin"; changed = true; }
+  }
+  return changed;
 }
 
-function restoreLocalFiles(user) {
+if (isVercel && databaseUrl) {
+  try {
+    databasePool = new Pool({ connectionString: databaseUrl, max: 3, connectionTimeoutMillis: 8000, idleTimeoutMillis: 10000 });
+    await initializePersistentDatabase();
+  } catch (error) {
+    databaseStartupError = "Persistent database connection failed.";
+    console.error(databaseStartupError, error instanceof Error ? error.message : "Unknown database error");
+    await databasePool?.end().catch(() => {});
+    databasePool = null;
+  }
+}
+
+if (!isVercel && migrateDbState(processDb)) await saveDb();
+
+async function initializePersistentDatabase() {
+  const client = await databasePool.connect();
+  try {
+    await client.query("CREATE TABLE IF NOT EXISTS cb_secure_app_state (id smallint PRIMARY KEY CHECK (id = 1), state jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())");
+    await client.query("INSERT INTO cb_secure_app_state (id, state) VALUES (1, $1::jsonb) ON CONFLICT (id) DO NOTHING", [JSON.stringify(emptyDb)]);
+    await client.query("BEGIN");
+    const result = await client.query("SELECT state FROM cb_secure_app_state WHERE id = 1 FOR UPDATE");
+    processDb = { ...emptyDb, ...(result.rows[0]?.state || {}) };
+    if (migrateDbState(processDb)) {
+      await client.query("UPDATE cb_secure_app_state SET state = $1::jsonb, updated_at = now() WHERE id = 1", [JSON.stringify(processDb)]);
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function deployedConfigurationIssues() {
+  if (!isVercel && !isRender) return [];
+  return [
+    isVercel && !databasePool && (databaseStartupError || "DATABASE_URL"),
+    jwtSecret.length < 32 && "JWT_SECRET",
+    !initialAdminEmail && "INITIAL_ADMIN_EMAIL",
+    isVercel && !smtpConfigured && "SMTP_HOST / SMTP_USER / SMTP_PASS",
+    isVercel && !process.env.BLOB_STORE_ID && !process.env.BLOB_READ_WRITE_TOKEN && "Private Blob storage connection",
+  ].filter(Boolean);
+}
+
+function persistentDatabaseMiddleware(req, res, next) {
+  if (!isVercel) return next();
+  if (!databasePool) return res.status(503).json({ error: "The hosted backend needs a persistent database connection.", missing: [databaseStartupError || "DATABASE_URL"] });
+  databasePool.connect().then(async (client) => {
+    try {
+      await client.query("BEGIN");
+      const result = await client.query("SELECT state FROM cb_secure_app_state WHERE id = 1 FOR UPDATE");
+      const requestDb = { ...emptyDb, ...(result.rows[0]?.state || {}) };
+      requestDb.pendingUploads ||= [];
+      const context = { db: requestDb, client, finishPromise: null, afterCommit: [] };
+      const finish = (commit) => {
+        if (!context.finishPromise) {
+          context.finishPromise = (async () => {
+            try {
+              await client.query(commit ? "COMMIT" : "ROLLBACK");
+              if (commit) {
+                for (const task of context.afterCommit) {
+                  try { await task(); }
+                  catch (error) { console.error("Post-commit storage cleanup failed.", error instanceof Error ? error.message : "Unknown error"); }
+                }
+              }
+            }
+            finally { client.release(); }
+          })();
+        }
+        return context.finishPromise;
+      };
+      res.locals.finishDatabaseTransaction = finish;
+      res.locals.afterDatabaseCommit = (task) => context.afterCommit.push(task);
+      const originalEnd = res.end.bind(res);
+      res.end = (...args) => {
+        void finish(res.statusCode < 500).then(
+          () => originalEnd(...args),
+          () => {
+            if (!res.headersSent) {
+              res.statusCode = 503;
+              res.setHeader("Content-Type", "application/json; charset=utf-8");
+              originalEnd(JSON.stringify({ error: "The hosted database could not save this request." }));
+            } else originalEnd(...args);
+          },
+        );
+        return res;
+      };
+      req.on("aborted", () => { void finish(false); });
+      res.on("close", () => { if (!res.writableFinished) void finish(false); });
+      dbContext.run(context, next);
+    } catch (error) {
+      client.release();
+      next(error);
+    }
+  }).catch(next);
+}
+
+async function saveDb() {
+  const context = dbContext.getStore();
+  if (context?.client) {
+    await context.client.query("UPDATE cb_secure_app_state SET state = $1::jsonb, updated_at = now() WHERE id = 1", [JSON.stringify(context.db)]);
+    return;
+  }
+  if (isVercel) throw new Error("The hosted backend cannot save data without its persistent database.");
+  await writeFile(dbPath, JSON.stringify(processDb, null, 2), "utf8");
+}
+
+function restoreLocalFiles(user, state = currentDb()) {
   let restored = 0;
-  for (const file of db.files) {
+  for (const file of state.files) {
     if (file.ownerId !== user.id && file.ownerEmail?.toLowerCase() === user.email.toLowerCase() && file.storage === "local" && !file.blockchainFileId) {
       file.ownerId = user.id;
       restored += 1;
@@ -190,11 +305,44 @@ const allowedOrigins = (process.env.CORS_ORIGIN || "http://localhost:5173").spli
 app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.includes(origin)) }));
 app.use(express.json({ limit: "1mb" }));
 app.use("/api/auth", rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false }));
+app.use("/api", (req, res, next) => {
+  if (req.path === "/health") return next();
+  const missing = deployedConfigurationIssues();
+  if (missing.length) {
+    return res.status(503).json({ error: "The hosted backend is deployed but needs its production resources configured.", missing });
+  }
+  return persistentDatabaseMiddleware(req, res, next);
+});
+
+for (const method of ["get", "post", "put", "patch", "delete"]) {
+  const register = app[method].bind(app);
+  app[method] = (routePath, ...handlers) => register(routePath, ...handlers.map((handler) => {
+    if (typeof handler !== "function" || handler.length === 4) return handler;
+    return (req, res, next) => {
+      try { Promise.resolve(handler(req, res, next)).catch(next); }
+      catch (error) { next(error); }
+    };
+  }));
+}
 
 app.get("/api/health", (_req, res) => {
+  const missing = [...deployedConfigurationIssues(), ...(!smtpConfigured && isRender ? ["Email delivery provider (SMTP)"] : [])];
   res.json({
-    status: "ok",
-    capabilities: { webCrypto: true, aes256gcm: true, sha256: true, ipfs: Boolean(process.env.PINATA_JWT), ethereum: "configure contract address in client" },
+    status: missing.length ? "setup_required" : "ok",
+    missing,
+    capabilities: {
+      webCrypto: true,
+      aes256gcm: true,
+      sha256: true,
+      database: Boolean(databasePool),
+      durableMetadata: Boolean(databasePool),
+      emailOtp: smtpConfigured,
+      privateBlobStorage: Boolean(process.env.BLOB_STORE_ID || process.env.BLOB_READ_WRITE_TOKEN),
+      directUploads: Boolean(isVercel && (process.env.BLOB_STORE_ID || process.env.BLOB_READ_WRITE_TOKEN)),
+      durableFileStorage: Boolean(process.env.PINATA_JWT || process.env.BLOB_STORE_ID || process.env.BLOB_READ_WRITE_TOKEN),
+      ipfs: Boolean(process.env.PINATA_JWT),
+      ethereum: "configure contract address in client",
+    },
     timestamp: new Date().toISOString(),
   });
 });
@@ -204,6 +352,7 @@ app.post("/api/auth/register", async (req, res) => {
   if (!name?.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail) || !password || password.length < 10) {
     return res.status(400).json({ error: "Provide a name, valid email, and password of at least 10 characters." });
   }
+  if (!smtpConfigured) return res.status(503).json({ error: "Email verification is not configured on this deployment yet." });
   if (db.users.some((user) => user.email === normalizedEmail)) return res.status(409).json({ error: "An account with that email already exists." });
   const passwordHash = await bcrypt.hash(password, 12);
   const hasAdmin = db.users.some((item) => item.role === "Admin");
@@ -224,6 +373,7 @@ app.post("/api/auth/login", async (req, res) => {
     await saveDb();
     return res.status(401).json({ error: "Email or password is incorrect." });
   }
+  if (!smtpConfigured) return res.status(503).json({ error: "Email verification is not configured on this deployment yet." });
   return issueChallenge(user, req, res);
 });
 
@@ -363,6 +513,183 @@ app.put("/api/users/:id/role", authenticate, requireRole("Admin"), async (req, r
   audit("ROLE_UPDATED", req.user, "Role updated for " + user.email + " to " + role + ".", req);
   await saveDb();
   res.json({ user: publicUser(user) });
+});
+
+const maximumFileSize = 100 * 1024 * 1024;
+const validIv = (value) => /^[A-Za-z0-9+/]{16}$/.test(value || "");
+const validSalt = (value) => /^[A-Za-z0-9+/]{22}==$/.test(value || "");
+const validWrappedKey = (value) => /^[A-Za-z0-9+/]{64}$/.test(value || "");
+
+function validateUploadMetadata(body, mode) {
+  const originalName = path.basename(String(body.originalName || "").trim()).slice(0, 255);
+  const originalSize = Number(body.size);
+  const encryptedSize = Number(body.encryptedSize);
+  if (!originalName || !Number.isSafeInteger(originalSize) || originalSize < 0 || originalSize > maximumFileSize
+    || !Number.isSafeInteger(encryptedSize) || encryptedSize < 16 || encryptedSize > maximumFileSize + 16
+    || encryptedSize !== originalSize + 16 || !/^[a-fA-F0-9]{64}$/.test(body.sha256Hash || "") || !validIv(body.iv)) {
+    return null;
+  }
+  const metadata = {
+    originalName,
+    originalSize,
+    encryptedSize,
+    mimeType: String(body.mimeType || "application/octet-stream").slice(0, 255),
+    sha256Hash: String(body.sha256Hash).toLowerCase(),
+    iv: String(body.iv),
+  };
+  if (mode === "create") {
+    if (!validWrappedKey(body.wrappedKey) || !validIv(body.wrapIv) || !validSalt(body.salt)) return null;
+    metadata.wrappedKey = String(body.wrappedKey);
+    metadata.wrapIv = String(body.wrapIv);
+    metadata.salt = String(body.salt);
+  }
+  return metadata;
+}
+
+async function createBlobUploadTicket(user, metadata, mode, fileId = null) {
+  const ticket = {
+    id: randomUUID(),
+    userId: user.id,
+    mode,
+    fileId,
+    pathname: "cb-secure/" + user.id + "/" + randomUUID() + ".bin",
+    metadata,
+    createdAt: new Date().toISOString(),
+    expiresAt: Date.now() + 15 * 60 * 1000,
+  };
+  db.pendingUploads = db.pendingUploads.filter((item) => item.expiresAt > Date.now());
+  db.pendingUploads.push(ticket);
+  await saveDb();
+  return ticket;
+}
+
+app.post("/api/files/upload-ticket", authenticate, async (req, res) => {
+  if (!isVercel || !process.env.BLOB_STORE_ID) return res.status(503).json({ error: "Private Blob storage is not connected to this deployment." });
+  const metadata = validateUploadMetadata(req.body || {}, "create");
+  if (!metadata) return res.status(400).json({ error: "Encrypted file metadata is incomplete or invalid." });
+  const ticket = await createBlobUploadTicket(req.user, metadata, "create");
+  res.status(201).json({ ticketId: ticket.id, pathname: ticket.pathname, mode: ticket.mode });
+});
+
+app.post("/api/files/:id/replace-ticket", authenticate, async (req, res) => {
+  if (!isVercel || !process.env.BLOB_STORE_ID) return res.status(503).json({ error: "Private Blob storage is not connected to this deployment." });
+  const file = db.files.find((item) => item.id === req.params.id);
+  if (!file) return res.status(404).json({ error: "File not found." });
+  const writeGrant = db.grants.find((item) => item.fileId === file.id && item.active && item.permissionLevel === 2 && item.recipientAddress?.toLowerCase() === req.user.walletAddress?.toLowerCase());
+  const canReplace = file.ownerId === req.user.id || ((req.user.role === "Editor" || req.user.role === "Admin") && writeGrant);
+  if (!canReplace) return res.status(403).json({ error: "Only the owner or an Editor with write access can replace this file." });
+  const metadata = validateUploadMetadata(req.body || {}, "replace");
+  if (!metadata) return res.status(400).json({ error: "Encrypted replacement metadata is incomplete or invalid." });
+  const ticket = await createBlobUploadTicket(req.user, metadata, "replace", file.id);
+  res.status(201).json({ ticketId: ticket.id, pathname: ticket.pathname, mode: ticket.mode });
+});
+
+app.post("/api/blob/upload", authenticate, async (req, res) => {
+  if (!isVercel || !process.env.BLOB_STORE_ID) return res.status(503).json({ error: "Private Blob storage is not connected to this deployment." });
+  try {
+    const response = await handleUploadPresigned({
+      request: req,
+      body: req.body,
+      getSignedToken: async (pathname, clientPayload) => {
+        let ticketId;
+        try { ticketId = JSON.parse(clientPayload || "{}").ticketId; } catch { throw new Error("A valid upload ticket is required."); }
+        const ticket = db.pendingUploads.find((item) => item.id === ticketId && item.userId === req.user.id && item.pathname === pathname);
+        if (!ticket || ticket.expiresAt <= Date.now()) throw new Error("The upload ticket is invalid or expired.");
+        const validUntil = Math.min(ticket.expiresAt, Date.now() + 15 * 60 * 1000);
+        const token = await issueSignedToken({
+          pathname: ticket.pathname,
+          operations: ["put"],
+          validUntil,
+          allowedContentTypes: ["application/octet-stream"],
+          maximumSizeInBytes: ticket.metadata.encryptedSize,
+        });
+        return {
+          token,
+          urlOptions: {
+            allowedContentTypes: ["application/octet-stream"],
+            maximumSizeInBytes: ticket.metadata.encryptedSize,
+            addRandomSuffix: false,
+            allowOverwrite: false,
+            validUntil,
+          },
+        };
+      },
+    });
+    res.json(response);
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : "Could not authorize the private upload." });
+  }
+});
+
+async function readCompletedBlob(ticket) {
+  try {
+    const metadata = await headBlob(ticket.pathname, { access: "private" });
+    if (metadata.size !== ticket.metadata.encryptedSize || metadata.contentType !== "application/octet-stream") return null;
+    return metadata;
+  } catch {
+    return null;
+  }
+}
+
+app.post("/api/files/upload-finalize", authenticate, async (req, res) => {
+  const ticket = db.pendingUploads.find((item) => item.id === req.body?.ticketId && item.userId === req.user.id && item.mode === "create");
+  if (!ticket || ticket.expiresAt <= Date.now()) return res.status(404).json({ error: "The upload ticket is invalid or expired." });
+  const blob = await readCompletedBlob(ticket);
+  if (!blob) return res.status(409).json({ error: "Private encrypted bytes were not found or did not match the upload ticket." });
+  const record = {
+    id: randomUUID(),
+    originalName: ticket.metadata.originalName,
+    size: ticket.metadata.originalSize,
+    mimeType: ticket.metadata.mimeType,
+    ipfsCid: "",
+    storagePath: ticket.pathname,
+    sha256Hash: ticket.metadata.sha256Hash,
+    iv: ticket.metadata.iv,
+    wrappedKey: ticket.metadata.wrappedKey,
+    wrapIv: ticket.metadata.wrapIv,
+    salt: ticket.metadata.salt,
+    storage: "blob",
+    ownerId: req.user.id,
+    ownerEmail: req.user.email,
+    ownerWallet: req.user.walletAddress,
+    blockchainFileId: null,
+    transactionHash: null,
+    createdAt: new Date().toISOString(),
+  };
+  db.pendingUploads = db.pendingUploads.filter((item) => item.id !== ticket.id);
+  db.files.unshift(record);
+  audit("FILE_UPLOADED", req.user, "Encrypted file stored in private object storage.", req);
+  await saveDb();
+  res.status(201).json({ file: record, message: "Encrypted bytes stored in private cloud storage." });
+});
+
+app.post("/api/files/:id/replace-finalize", authenticate, async (req, res) => {
+  const ticket = db.pendingUploads.find((item) => item.id === req.body?.ticketId && item.userId === req.user.id && item.mode === "replace" && item.fileId === req.params.id);
+  if (!ticket || ticket.expiresAt <= Date.now()) return res.status(404).json({ error: "The replacement ticket is invalid or expired." });
+  const file = db.files.find((item) => item.id === ticket.fileId);
+  if (!file) return res.status(404).json({ error: "File not found." });
+  const writeGrant = db.grants.find((item) => item.fileId === file.id && item.active && item.permissionLevel === 2 && item.recipientAddress?.toLowerCase() === req.user.walletAddress?.toLowerCase());
+  const canReplace = file.ownerId === req.user.id || ((req.user.role === "Editor" || req.user.role === "Admin") && writeGrant);
+  if (!canReplace) return res.status(403).json({ error: "Write access was revoked before the replacement completed." });
+  const blob = await readCompletedBlob(ticket);
+  if (!blob) return res.status(409).json({ error: "Private encrypted bytes were not found or did not match the upload ticket." });
+  const oldPath = file.storage === "blob" ? file.storagePath : null;
+  file.storage = "blob";
+  file.storagePath = ticket.pathname;
+  file.ipfsCid = "";
+  file.originalName = ticket.metadata.originalName;
+  file.size = ticket.metadata.originalSize;
+  file.mimeType = ticket.metadata.mimeType;
+  file.iv = ticket.metadata.iv;
+  file.sha256Hash = ticket.metadata.sha256Hash;
+  file.updatedAt = new Date().toISOString();
+  db.pendingUploads = db.pendingUploads.filter((item) => item.id !== ticket.id);
+  audit("FILE_CONTENT_REPLACED", req.user, "Replaced encrypted content for " + file.originalName + ".", req);
+  await saveDb();
+  if (oldPath && oldPath !== ticket.pathname && res.locals.afterDatabaseCommit) {
+    res.locals.afterDatabaseCommit(() => deleteBlob(oldPath, { access: "private" }));
+  }
+  res.json({ file });
 });
 
 app.post("/api/files/upload", authenticate, upload.single("ciphertext"), async (req, res) => {
@@ -532,6 +859,18 @@ app.get("/api/files/:id/download", authenticate, async (req, res) => {
     await saveDb();
     return res.status(403).json({ error: "This wallet is not authorized for the file." });
   }
+  if (file.storage === "blob" && file.storagePath) {
+    const validUntil = Date.now() + 5 * 60 * 1000;
+    const signedToken = await issueSignedToken({ pathname: file.storagePath, operations: ["get"], validUntil });
+    const { presignedUrl } = await presignUrl(signedToken, {
+      operation: "get",
+      pathname: file.storagePath,
+      access: "private",
+      validUntil,
+      useCache: false,
+    });
+    return res.json({ downloadUrl: presignedUrl });
+  }
   if (file.storage === "ipfs") {
     return res.redirect("https://gateway.pinata.cloud/ipfs/" + encodeURIComponent(file.ipfsCid));
   }
@@ -602,7 +941,8 @@ app.post("/api/activity/record", authenticate, async (req, res) => {
 app.get("/api/notifications", authenticate, (req, res) => {
   res.json(db.activity.filter((item) => item.userEmail === req.user.email).slice(0, 20));
 });
-if (process.env.NODE_ENV === "production") {
+if (process.env.NODE_ENV === "production" && !isVercel) {
+  const frontendDist = path.resolve(here, "../../frontend/dist");
   app.use(express.static(frontendDist, { index: false, maxAge: "1h" }));
   app.get("*", (req, res, next) => {
     if (req.path === "/api" || req.path.startsWith("/api/")) return next();
@@ -611,8 +951,11 @@ if (process.env.NODE_ENV === "production") {
 }
 app.use((error, _req, res, _next) => {
   if (error instanceof multer.MulterError) return res.status(413).json({ error: "Upload exceeds the 100 MB file limit." });
+  console.error("CB SECURE request failed.", error instanceof Error ? error.message : "Unknown error");
   res.status(500).json({ error: "Unexpected server error." });
 });
 
-app.listen(port, "0.0.0.0", () => console.log("CB SECURE service listening on port " + port));
+if (!isVercel) app.listen(port, "0.0.0.0", () => console.log("CB SECURE service listening on port " + port));
+
+export default app;
 

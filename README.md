@@ -31,11 +31,13 @@ The activity log records registration, successful sign-ins, email OTP, and file/
 
 With no `PINATA_JWT`, encrypted bytes are stored in `backend/data/storage` and metadata in `backend/data/db.json`. Set `CB_SECURE_DATA_DIR` to move that data directory, as the Render setup does with its persistent disk. Set `PINATA_JWT` in `backend/.env` to pin ciphertext to Pinata IPFS. Never store plaintext files in the storage adapter.
 
-## Deployment notes
+## Render deployment
 
-The app can serve its built frontend and API from one Node process in production. Set `NODE_ENV=production`, `JWT_SECRET`, `INITIAL_ADMIN_EMAIL`, and working SMTP settings. Set `CB_SECURE_DATA_DIR` to a durable data mount so the JSON database, encrypted uploads, and temporary uploads survive restarts.
+The root-level `render.yaml` deploys the frontend and Express API together as one free Node web service. Render generates `JWT_SECRET` for the service. Set `INITIAL_ADMIN_EMAIL` in the Render service environment before registering the first account; that verified account becomes the first Admin. The site and API use the same Render URL.
 
-Render Free cannot run this app as a durable vault with its current local storage and Gmail SMTP setup: its filesystem is erased on restarts and spin-downs, it blocks outbound SMTP ports 25, 465, and 587, and its free Postgres expires after 30 days. See [Render Free instance limits](https://render.com/docs/free). Choose a host with durable storage and an email delivery route before deploying user data.
+Render Free is suitable for a temporary preview, not durable vault storage. Its web service filesystem is ephemeral and is cleared when the service spins down, restarts, or redeploys. Free web services also cannot send outbound SMTP over ports 25, 465, or 587, so Gmail SMTP OTP delivery will not work there. Until an email provider reachable over HTTPS or an allowed port is configured, email/password registration and sign-in return a setup error. Free Render Postgres expires 30 days after creation. See [Render Free instance limits](https://render.com/docs/free).
+
+Do not store real user files or accounts on this temporary Free deployment. It stores local metadata and ciphertext on the service filesystem, which can be lost. For durable use, move metadata to a persistent database and encrypted file bytes to durable object storage, then configure an email delivery provider.
 
 To use the optional Hardhat contract, install dependencies with `npm install --prefix contracts`, start a local node with `npm run contracts:node`, deploy with `npm run contracts:deploy`, and set the deployed address as `VITE_CONTRACT_ADDRESS` in `frontend/.env`. Connect MetaMask to the same network. A local-chain record still requires an IPFS CID, so configure Pinata for that path.
 
