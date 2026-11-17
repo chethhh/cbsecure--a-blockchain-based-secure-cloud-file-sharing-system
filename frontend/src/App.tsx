@@ -730,7 +730,7 @@ function App() {
           <div className="storage-card-head"><span><HardDrive size={15} /> VAULT CAPACITY</span><span>SECURE</span></div>
           <div className="capacity-bar"><span style={{ width: files.length ? "22%" : "4%" }} /></div>
           <div className="storage-caption"><strong>{formatBytes(savedBytes)}</strong><span>encrypted</span></div>
-          <p>Each encrypted file can be up to 100 MB.</p>
+          <p>Each encrypted file can be up to 20 MB on this free Cloudflare deployment.</p>
         </div>
         <button className="help-card" onClick={() => selectView("integrity")}><span className="help-icon"><Sparkles size={15} /></span><span><strong>Integrity tools</strong><small>Explore security checks</small></span><ArrowUpRight size={14} /></button>
         <div className="sidebar-user">

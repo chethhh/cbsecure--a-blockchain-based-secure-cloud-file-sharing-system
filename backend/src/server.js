@@ -1,20 +1,14 @@
-import "dotenv/config";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { Readable } from "node:stream";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
-import rateLimit from "express-rate-limit";
 import multer from "multer";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import nodemailer from "nodemailer";
 import { OAuth2Client } from "google-auth-library";
-import { Pool } from "@neondatabase/serverless";
-import { Firestore } from "@google-cloud/firestore";
-import { Storage } from "@google-cloud/storage";
-import { del as deleteBlob, head as headBlob, issueSignedToken, presignUrl } from "@vercel/blob";
-import { handleUploadPresigned } from "@vercel/blob/client";
-import { randomInt, createHash, randomUUID } from "node:crypto";
+import { randomInt, createHash, randomUUID, randomBytes } from "node:crypto";
 import { mkdir, readFile, writeFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -22,17 +16,22 @@ import { fileURLToPath } from "node:url";
 import { verifyMessage, getAddress } from "ethers";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const isCloudflare = process.env.CF_WORKERS === "true";
+if (!isCloudflare) await import("dotenv/config");
+const rateLimit = isCloudflare ? null : (await import("express-rate-limit")).default;
 const isVercel = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
 const isRender = Boolean(process.env.RENDER || process.env.RENDER_SERVICE_ID);
 const isNetlify = Boolean(process.env.NETLIFY);
 const isCloudRun = Boolean(process.env.K_SERVICE || process.env.CLOUD_RUN);
 const isFunctionPlatform = isVercel || isNetlify;
-const isServerless = isFunctionPlatform || isCloudRun;
+const isServerless = isFunctionPlatform || isCloudRun || isCloudflare;
 const privateBlobConfigured = Boolean(process.env.BLOB_STORE_ID && process.env.BLOB_READ_WRITE_TOKEN);
 const storageBucketName = String(process.env.GCS_BUCKET || "").trim();
-const firestore = isCloudRun ? new Firestore({ projectId: process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT }) : null;
+const googleCloud = isCloudRun ? await import("@google-cloud/firestore") : null;
+const googleStorage = isCloudRun ? await import("@google-cloud/storage") : null;
+const firestore = isCloudRun ? new googleCloud.Firestore({ projectId: process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT }) : null;
 const firestoreStateRef = firestore?.collection("cb_secure").doc("app_state") || null;
-const cloudStorage = isCloudRun && storageBucketName ? new Storage({ projectId: process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT }) : null;
+const cloudStorage = isCloudRun && storageBucketName ? new googleStorage.Storage({ projectId: process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT }) : null;
 const dataDir = process.env.CB_SECURE_DATA_DIR
   ? path.resolve(process.env.CB_SECURE_DATA_DIR)
   : isServerless ? path.join(tmpdir(), "cb-secure-runtime") : path.resolve(here, "../data");
@@ -43,14 +42,27 @@ const app = express();
 const port = Number(process.env.PORT || 3000);
 const jwtSecret = process.env.JWT_SECRET || "";
 const initialAdminEmail = String(process.env.INITIAL_ADMIN_EMAIL || "").trim().toLowerCase();
+const cloudflareAuthPepper = String(process.env.CF_AUTH_PEPPER || "");
+const cloudflarePasswordHashIterations = 100_000;
+const cloudflarePasswordHashPrefix = "cf-pbkdf2-sha256";
 const googleClientId = String(process.env.GOOGLE_CLIENT_ID || "").trim();
-const googleClient = googleClientId ? new OAuth2Client(googleClientId) : null;
+const googleAuth = googleClientId ? await import("google-auth-library") : null;
+const googleClient = googleClientId ? new googleAuth.OAuth2Client(googleClientId) : null;
 const smtpConfigured = Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
 const databaseUrl = process.env.NETLIFY_DB_URL || process.env.DATABASE_URL || process.env.POSTGRES_URL || "";
+const blobModule = isVercel ? await import("@vercel/blob") : null;
+const blobClientModule = isVercel ? await import("@vercel/blob/client") : null;
+const deleteBlob = blobModule?.del;
+const headBlob = blobModule?.head;
+const issueSignedToken = blobModule?.issueSignedToken;
+const presignUrl = blobModule?.presignUrl;
+const handleUploadPresigned = blobClientModule?.handleUploadPresigned;
 
 if (!isServerless && jwtSecret.length < 32) throw new Error("Set JWT_SECRET to a random value with at least 32 characters.");
-await mkdir(storageDir, { recursive: true });
-await mkdir(incomingDir, { recursive: true });
+if (!isCloudflare) {
+  await mkdir(storageDir, { recursive: true });
+  await mkdir(incomingDir, { recursive: true });
+}
 
 const emptyDb = { users: [], files: [], grants: [], activity: [], challenges: [], walletNonces: [], pendingUploads: [] };
 const dbContext = new AsyncLocalStorage();
@@ -90,6 +102,7 @@ function migrateDbState(state) {
 
 if (isFunctionPlatform && databaseUrl) {
   try {
+    const { Pool } = await import("@neondatabase/serverless");
     databasePool = new Pool({ connectionString: databaseUrl, max: 3, connectionTimeoutMillis: 8000, idleTimeoutMillis: 10000 });
     await initializePersistentDatabase();
   } catch (error) {
@@ -138,15 +151,225 @@ function deployedConfigurationIssues() {
     isFunctionPlatform && !databasePool && (databaseStartupError || "NETLIFY_DB_URL / DATABASE_URL"),
     isCloudRun && firestoreStartupError,
     isCloudRun && !firestoreStateRef && "Firestore database",
+    isCloudflare && process.env.CF_D1_ACTIVE !== "true" && "Cloudflare D1 binding",
+    isCloudflare && cloudflareAuthPepper.length < 32 && "CF_AUTH_PEPPER",
     jwtSecret.length < 32 && "JWT_SECRET",
     !initialAdminEmail && "INITIAL_ADMIN_EMAIL",
-    isServerless && !smtpConfigured && "SMTP_HOST / SMTP_USER / SMTP_PASS",
+    (isFunctionPlatform || isCloudflare) && !smtpConfigured && "SMTP_HOST / SMTP_USER / SMTP_PASS",
     isFunctionPlatform && !privateBlobConfigured && "Private Blob storage connection",
     isCloudRun && !cloudStorage && "GCS_BUCKET",
   ].filter(Boolean);
 }
 
 let firestoreRequestQueue = Promise.resolve();
+const recordKeys = {
+  users: "id",
+  files: "id",
+  grants: "grantId",
+  activity: "id",
+  challenges: "id",
+  walletNonces: "userId",
+  pendingUploads: "id",
+};
+
+function cloudflareEnvironment() {
+  return dbContext.getStore()?.env || null;
+}
+
+function privateStorageConfigured() {
+  return isCloudflare ? process.env.CF_D1_ACTIVE === "true" : privateBlobConfigured;
+}
+
+const cloudflareFileChunkBytes = 1_800_000;
+const cloudflareFileChunkBatchSize = 8;
+const authRateLimitState = new Map();
+
+function encodeBase64Url(bytes) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/g, "");
+}
+
+function decodeBase64Url(value) {
+  const normalized = value.replaceAll("-", "+").replaceAll("_", "/");
+  const binary = atob(normalized + "=".repeat((4 - normalized.length % 4) % 4));
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+}
+
+async function hashPassword(password) {
+  if (!isCloudflare) return bcrypt.hash(password, 12);
+  if (cloudflareAuthPepper.length < 32) throw new Error("CF_AUTH_PEPPER is not configured.");
+  const salt = randomBytes(16);
+  const material = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(String(password) + "\0" + cloudflareAuthPepper),
+    "PBKDF2",
+    false,
+    ["deriveBits"],
+  );
+  const derived = new Uint8Array(await crypto.subtle.deriveBits({
+    name: "PBKDF2",
+    hash: "SHA-256",
+    salt,
+    iterations: cloudflarePasswordHashIterations,
+  }, material, 256));
+  return [cloudflarePasswordHashPrefix, cloudflarePasswordHashIterations, encodeBase64Url(salt), encodeBase64Url(derived)].join("$");
+}
+
+async function verifyPassword(password, storedHash) {
+  if (typeof storedHash !== "string") return false;
+  if (isCloudflare && storedHash.startsWith(cloudflarePasswordHashPrefix + "$")) {
+    if (cloudflareAuthPepper.length < 32) throw new Error("CF_AUTH_PEPPER is not configured.");
+    const [, iterationsValue, saltValue, expectedValue] = storedHash.split("$");
+    const iterations = Number(iterationsValue);
+    if (!Number.isSafeInteger(iterations) || iterations < 10_000 || iterations > cloudflarePasswordHashIterations) return false;
+    let salt;
+    let expected;
+    try {
+      salt = decodeBase64Url(saltValue);
+      expected = decodeBase64Url(expectedValue);
+    } catch {
+      return false;
+    }
+    if (salt.length !== 16 || expected.length !== 32) return false;
+    const material = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(String(password) + "\0" + cloudflareAuthPepper),
+      "PBKDF2",
+      false,
+      ["deriveBits"],
+    );
+    const actual = new Uint8Array(await crypto.subtle.deriveBits({
+      name: "PBKDF2",
+      hash: "SHA-256",
+      salt,
+      iterations,
+    }, material, 256));
+    return crypto.subtle.timingSafeEqual(actual, expected);
+  }
+  return bcrypt.compare(String(password), storedHash);
+}
+
+function cloudflareAuthRateLimit(req, res, next) {
+  const now = Date.now();
+  const address = req.get("cf-connecting-ip") || req.ip || "unknown";
+  let window = authRateLimitState.get(address);
+  if (!window || now - window.startedAt >= 15 * 60 * 1000) {
+    window = { startedAt: now, count: 0 };
+    authRateLimitState.set(address, window);
+  }
+  if (window.count >= 30) {
+    res.setHeader("Retry-After", String(Math.ceil((15 * 60 * 1000 - (now - window.startedAt)) / 1000)));
+    return res.status(429).json({ error: "Too many authentication attempts. Try again later." });
+  }
+  window.count += 1;
+  if (authRateLimitState.size > 1000) {
+    for (const [key, value] of authRateLimitState) {
+      if (now - value.startedAt >= 15 * 60 * 1000) authRateLimitState.delete(key);
+    }
+  }
+  next();
+}
+
+export function runWithCloudflareEnvironment(env, handler) {
+  return dbContext.run({ env }, handler);
+}
+
+async function deleteCloudflareFileChunks(storageKey) {
+  const d1 = dbContext.getStore()?.d1;
+  if (d1 && storageKey) await d1.prepare("DELETE FROM cb_secure_file_chunks WHERE storage_key = ?").bind(storageKey).run();
+}
+
+function collectRecords(state) {
+  const records = new Map();
+  for (const [collection, keyName] of Object.entries(recordKeys)) {
+    for (const item of state[collection] || []) {
+      const key = item?.[keyName];
+      if (key !== undefined && key !== null) records.set(collection + "\u0000" + String(key), JSON.stringify(item));
+    }
+  }
+  return records;
+}
+
+async function cloudflareDatabaseMiddleware(req, res, next) {
+  const inherited = dbContext.getStore() || {};
+  const env = inherited.env;
+  const d1 = env?.DB;
+  if (!d1 || process.env.CF_D1_ACTIVE !== "true") {
+    return res.status(503).json({ error: "The hosted backend needs a persistent database connection.", missing: ["Cloudflare D1 binding"] });
+  }
+  try {
+    const result = await d1.prepare("SELECT collection, record_key, payload FROM cb_secure_records").all();
+    const requestDb = structuredClone(emptyDb);
+    const originalRecords = new Map();
+    for (const row of result.results || []) {
+      const collection = String(row.collection);
+      const item = JSON.parse(String(row.payload));
+      if (!Object.hasOwn(recordKeys, collection)) continue;
+      requestDb[collection].push(item);
+      originalRecords.set(collection + "\u0000" + String(row.record_key), String(row.payload));
+    }
+    requestDb.activity.sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
+    requestDb.files.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    const context = { ...inherited, db: requestDb, d1, originalRecords, dirty: false, finishPromise: null, afterCommit: [] };
+    const finish = (commit) => {
+      if (!context.finishPromise) {
+        context.finishPromise = (async () => {
+          try {
+            if (commit && context.dirty) {
+              const currentRecords = collectRecords(context.db);
+              const statements = [];
+              for (const compoundKey of originalRecords.keys()) {
+                if (currentRecords.has(compoundKey)) continue;
+                const splitAt = compoundKey.indexOf("\u0000");
+                const collection = compoundKey.slice(0, splitAt);
+                const recordKey = compoundKey.slice(splitAt + 1);
+                statements.push(d1.prepare("DELETE FROM cb_secure_records WHERE collection = ? AND record_key = ?").bind(collection, recordKey));
+              }
+              for (const [compoundKey, payload] of currentRecords) {
+                if (originalRecords.get(compoundKey) === payload) continue;
+                const splitAt = compoundKey.indexOf("\u0000");
+                const collection = compoundKey.slice(0, splitAt);
+                const recordKey = compoundKey.slice(splitAt + 1);
+                statements.push(d1.prepare("INSERT INTO cb_secure_records (collection, record_key, payload) VALUES (?, ?, ?) ON CONFLICT(collection, record_key) DO UPDATE SET payload = excluded.payload").bind(collection, recordKey, payload));
+              }
+              if (statements.length) await d1.batch(statements);
+              processDb = context.db;
+              for (const task of context.afterCommit) {
+                try { await task(); }
+                catch (error) { console.error("Post-commit storage cleanup failed.", error instanceof Error ? error.message : "Unknown error"); }
+              }
+            }
+          } finally { }
+        })();
+      }
+      return context.finishPromise;
+    };
+    res.locals.finishDatabaseTransaction = finish;
+    res.locals.afterDatabaseCommit = (task) => context.afterCommit.push(task);
+    const originalEnd = res.end.bind(res);
+    res.end = (...args) => {
+      void finish(res.statusCode < 500).then(
+        () => originalEnd(...args),
+        () => {
+          if (!res.headersSent) {
+            res.statusCode = 503;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            originalEnd(JSON.stringify({ error: "The hosted database could not save this request." }));
+          } else originalEnd(...args);
+        },
+      );
+      return res;
+    };
+    req.on("aborted", () => { void finish(false); });
+    res.on("close", () => { if (!res.writableFinished) void finish(false); });
+    dbContext.run(context, next);
+  } catch (error) {
+    console.error("Cloudflare D1 request failed.", error instanceof Error ? error.message : "Unknown error");
+    next(error);
+  }
+}
+
 async function firestoreRequestMiddleware(req, res, next) {
   let release;
   const previous = firestoreRequestQueue;
@@ -198,6 +421,7 @@ async function firestoreRequestMiddleware(req, res, next) {
 
 function persistentDatabaseMiddleware(req, res, next) {
   if (isCloudRun) return firestoreStartupError ? res.status(503).json({ error: "The hosted backend needs a persistent database connection.", missing: [firestoreStartupError] }) : firestoreRequestMiddleware(req, res, next);
+  if (isCloudflare) return cloudflareDatabaseMiddleware(req, res, next);
   if (!isFunctionPlatform) return next();
   if (!databasePool) return res.status(503).json({ error: "The hosted backend needs a persistent database connection.", missing: [databaseStartupError || "DATABASE_URL"] });
   databasePool.connect().then(async (client) => {
@@ -252,6 +476,10 @@ function persistentDatabaseMiddleware(req, res, next) {
 
 async function saveDb() {
   const context = dbContext.getStore();
+  if (context?.d1) {
+    context.dirty = true;
+    return;
+  }
   if (context?.firestore) {
     context.dirty = true;
     return;
@@ -379,10 +607,12 @@ function requireRole(...roles) {
   };
 }
 
-const upload = multer({
-  dest: incomingDir,
-  limits: { fileSize: isCloudRun ? 30 * 1024 * 1024 : 100 * 1024 * 1024, files: 1, fields: 8, parts: 9, fieldSize: 4096 },
-});
+const upload = isCloudflare
+  ? { single: () => (_req, res) => res.status(410).json({ error: "Use the secure upload ticket flow for Cloudflare storage." }) }
+  : multer({
+    dest: incomingDir,
+    limits: { fileSize: isCloudRun ? 30 * 1024 * 1024 : 100 * 1024 * 1024, files: 1, fields: 8, parts: 9, fieldSize: 4096 },
+  });
 
 async function saveCloudStorageObject(ownerId, bytes, digest) {
   const objectName = "cb-secure/" + ownerId + "/" + digest + ".bin";
@@ -410,7 +640,7 @@ const allowedOrigins = new Set([
 ].filter(Boolean).flatMap((value) => value.split(",")).map((value) => value.trim()));
 app.use(cors({ origin: (origin, callback) => callback(null, !origin || allowedOrigins.has(origin)) }));
 app.use(express.json({ limit: "1mb" }));
-app.use("/api/auth", rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false }));
+app.use("/api/auth", isCloudflare ? cloudflareAuthRateLimit : rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false }));
 app.use("/api", (req, res, next) => {
   if (req.path === "/health") return next();
   const missing = deployedConfigurationIssues();
@@ -432,7 +662,7 @@ for (const method of ["get", "post", "put", "patch", "delete"]) {
 }
 
 app.get("/api/health", (_req, res) => {
-  const missing = [...deployedConfigurationIssues(), ...(!smtpConfigured && isRender ? ["Email delivery provider (SMTP)"] : [])];
+  const missing = deployedConfigurationIssues();
   res.json({
     status: missing.length ? "setup_required" : "ok",
     missing,
@@ -440,12 +670,13 @@ app.get("/api/health", (_req, res) => {
       webCrypto: true,
       aes256gcm: true,
       sha256: true,
-      database: Boolean(databasePool),
-      durableMetadata: Boolean(databasePool),
+      database: Boolean(databasePool) || (isCloudflare && process.env.CF_D1_ACTIVE === "true"),
+      durableMetadata: Boolean(databasePool) || (isCloudflare && process.env.CF_D1_ACTIVE === "true"),
       emailOtp: smtpConfigured,
       privateBlobStorage: privateBlobConfigured,
-      directUploads: privateBlobConfigured,
-      durableFileStorage: Boolean(process.env.PINATA_JWT || privateBlobConfigured),
+      cloudflareD1FileStorage: isCloudflare && process.env.CF_D1_ACTIVE === "true",
+      directUploads: privateBlobConfigured || (isCloudflare && process.env.CF_D1_ACTIVE === "true"),
+      durableFileStorage: Boolean(process.env.PINATA_JWT || privateBlobConfigured || (isCloudflare && process.env.CF_D1_ACTIVE === "true")),
       ipfs: Boolean(process.env.PINATA_JWT),
       ethereum: "configure contract address in client",
     },
@@ -460,7 +691,7 @@ app.post("/api/auth/register", async (req, res) => {
   }
   if (!smtpConfigured) return res.status(503).json({ error: "Email verification is not configured on this deployment yet." });
   if (db.users.some((user) => user.email === normalizedEmail)) return res.status(409).json({ error: "An account with that email already exists." });
-  const passwordHash = await bcrypt.hash(password, 12);
+  const passwordHash = await hashPassword(password);
   const hasAdmin = db.users.some((item) => item.role === "Admin");
   const isConfiguredAdmin = initialAdminEmail && normalizedEmail === initialAdminEmail;
   const role = !hasAdmin && isConfiguredAdmin ? "Admin" : "Reader";
@@ -473,7 +704,7 @@ app.post("/api/auth/register", async (req, res) => {
 app.post("/api/auth/login", async (req, res) => {
   const email = String(req.body?.email || "").toLowerCase();
   const user = db.users.find((item) => item.email === email);
-  const valid = user?.passwordHash && await bcrypt.compare(String(req.body?.password || ""), user.passwordHash);
+  const valid = user?.passwordHash && await verifyPassword(String(req.body?.password || ""), user.passwordHash);
   if (!valid) {
     audit("LOGIN_FAILED", user, "Invalid email or password.", req);
     await saveDb();
@@ -621,7 +852,7 @@ app.put("/api/users/:id/role", authenticate, requireRole("Admin"), async (req, r
   res.json({ user: publicUser(user) });
 });
 
-const maximumFileSize = 100 * 1024 * 1024;
+const maximumFileSize = isCloudflare ? 20 * 1024 * 1024 : 100 * 1024 * 1024;
 const validIv = (value) => /^[A-Za-z0-9+/]{16}$/.test(value || "");
 const validSalt = (value) => /^[A-Za-z0-9+/]{22}==$/.test(value || "");
 const validWrappedKey = (value) => /^[A-Za-z0-9+/]{64}$/.test(value || "");
@@ -670,7 +901,7 @@ async function createBlobUploadTicket(user, metadata, mode, fileId = null) {
 }
 
 app.post("/api/files/upload-ticket", authenticate, async (req, res) => {
-  if (!privateBlobConfigured) return res.status(503).json({ error: "Private Blob storage is not connected to this deployment." });
+  if (!privateStorageConfigured()) return res.status(503).json({ error: "Private object storage is not connected to this deployment." });
   const metadata = validateUploadMetadata(req.body || {}, "create");
   if (!metadata) return res.status(400).json({ error: "Encrypted file metadata is incomplete or invalid." });
   const ticket = await createBlobUploadTicket(req.user, metadata, "create");
@@ -678,7 +909,7 @@ app.post("/api/files/upload-ticket", authenticate, async (req, res) => {
 });
 
 app.post("/api/files/:id/replace-ticket", authenticate, async (req, res) => {
-  if (!privateBlobConfigured) return res.status(503).json({ error: "Private Blob storage is not connected to this deployment." });
+  if (!privateStorageConfigured()) return res.status(503).json({ error: "Private object storage is not connected to this deployment." });
   const file = db.files.find((item) => item.id === req.params.id);
   if (!file) return res.status(404).json({ error: "File not found." });
   const writeGrant = db.grants.find((item) => item.fileId === file.id && item.active && item.permissionLevel === 2 && item.recipientAddress?.toLowerCase() === req.user.walletAddress?.toLowerCase());
@@ -691,7 +922,66 @@ app.post("/api/files/:id/replace-ticket", authenticate, async (req, res) => {
 });
 
 app.post("/api/blob/upload", authenticate, async (req, res) => {
-  if (!privateBlobConfigured) return res.status(503).json({ error: "Private Blob storage is not connected to this deployment." });
+  if (!privateStorageConfigured()) return res.status(503).json({ error: "Private object storage is not connected to this deployment." });
+  if (isCloudflare) {
+    const d1 = dbContext.getStore()?.d1;
+    const ticketId = String(req.get("x-upload-ticket") || "");
+    const ticket = db.pendingUploads.find((item) => item.id === ticketId && item.userId === req.user.id);
+    const removePartialUpload = async () => {
+      if (ticket && d1) await d1.prepare("DELETE FROM cb_secure_file_chunks WHERE storage_key = ?").bind(ticket.pathname).run();
+    };
+    let reader;
+    try {
+      if (!ticket || ticket.expiresAt <= Date.now()) return res.status(404).json({ error: "The upload ticket is invalid or expired." });
+      if (!d1) return res.status(503).json({ error: "Cloudflare D1 storage is unavailable." });
+      if (req.get("content-type")?.split(";")[0].trim().toLowerCase() !== "application/octet-stream") {
+        return res.status(400).json({ error: "The upload must contain encrypted application/octet-stream bytes." });
+      }
+      await removePartialUpload();
+      reader = Readable.toWeb(req).getReader();
+      let received = 0;
+      let chunkIndex = 0;
+      let pendingSize = 0;
+      let pendingParts = [];
+      let statements = [];
+      const queueChunk = async (size) => {
+        const payload = new Uint8Array(size);
+        let offset = 0;
+        for (const part of pendingParts) { payload.set(part, offset); offset += part.byteLength; }
+        statements.push(d1.prepare("INSERT INTO cb_secure_file_chunks (storage_key, chunk_index, payload) VALUES (?, ?, ?)").bind(ticket.pathname, chunkIndex++, payload));
+        pendingParts = [];
+        pendingSize = 0;
+        if (statements.length >= cloudflareFileChunkBatchSize) {
+          await d1.batch(statements);
+          statements = [];
+        }
+      };
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+        received += bytes.byteLength;
+        if (received > ticket.metadata.encryptedSize) throw new Error("The encrypted upload is larger than its ticket allows.");
+        let offset = 0;
+        while (offset < bytes.byteLength) {
+          const take = Math.min(cloudflareFileChunkBytes - pendingSize, bytes.byteLength - offset);
+          pendingParts.push(bytes.subarray(offset, offset + take));
+          pendingSize += take;
+          offset += take;
+          if (pendingSize === cloudflareFileChunkBytes) await queueChunk(pendingSize);
+        }
+      }
+      if (received !== ticket.metadata.encryptedSize) throw new Error("The encrypted upload size did not match its ticket.");
+      if (pendingSize) await queueChunk(pendingSize);
+      if (statements.length) await d1.batch(statements);
+      return res.status(201).json({ uploaded: true });
+    } catch (error) {
+      await reader?.cancel().catch(() => {});
+      await removePartialUpload().catch(() => {});
+      console.error("Cloudflare D1 file upload failed.", error instanceof Error ? error.message : "Unknown error");
+      return res.status(502).json({ error: "Ciphertext storage failed." });
+    }
+  }
   try {
     const response = await handleUploadPresigned({
       request: req,
@@ -729,6 +1019,14 @@ app.post("/api/blob/upload", authenticate, async (req, res) => {
 
 async function readCompletedBlob(ticket) {
   try {
+    if (isCloudflare) {
+      const d1 = dbContext.getStore()?.d1;
+      if (!d1) return null;
+      const summary = await d1.prepare("SELECT COUNT(*) AS chunks, COALESCE(SUM(length(payload)), 0) AS byte_length FROM cb_secure_file_chunks WHERE storage_key = ?").bind(ticket.pathname).first();
+      const expectedChunks = Math.ceil(ticket.metadata.encryptedSize / cloudflareFileChunkBytes);
+      if (Number(summary?.chunks) !== expectedChunks || Number(summary?.byte_length) !== ticket.metadata.encryptedSize) return null;
+      return summary;
+    }
     const metadata = await headBlob(ticket.pathname, { access: "private" });
     if (metadata.size !== ticket.metadata.encryptedSize || metadata.contentType !== "application/octet-stream") return null;
     return metadata;
@@ -754,7 +1052,8 @@ app.post("/api/files/upload-finalize", authenticate, async (req, res) => {
     wrappedKey: ticket.metadata.wrappedKey,
     wrapIv: ticket.metadata.wrapIv,
     salt: ticket.metadata.salt,
-    storage: "blob",
+    storage: isCloudflare ? "d1" : "blob",
+    encryptedSize: ticket.metadata.encryptedSize,
     ownerId: req.user.id,
     ownerEmail: req.user.email,
     ownerWallet: req.user.walletAddress,
@@ -779,9 +1078,10 @@ app.post("/api/files/:id/replace-finalize", authenticate, async (req, res) => {
   if (!canReplace) return res.status(403).json({ error: "Write access was revoked before the replacement completed." });
   const blob = await readCompletedBlob(ticket);
   if (!blob) return res.status(409).json({ error: "Private encrypted bytes were not found or did not match the upload ticket." });
-  const oldPath = file.storage === "blob" ? file.storagePath : null;
-  file.storage = "blob";
+  const oldPath = ["blob", "d1"].includes(file.storage) ? file.storagePath : null;
+  file.storage = isCloudflare ? "d1" : "blob";
   file.storagePath = ticket.pathname;
+  file.encryptedSize = ticket.metadata.encryptedSize;
   file.ipfsCid = "";
   file.originalName = ticket.metadata.originalName;
   file.size = ticket.metadata.originalSize;
@@ -793,7 +1093,7 @@ app.post("/api/files/:id/replace-finalize", authenticate, async (req, res) => {
   audit("FILE_CONTENT_REPLACED", req.user, "Replaced encrypted content for " + file.originalName + ".", req);
   await saveDb();
   if (oldPath && oldPath !== ticket.pathname && res.locals.afterDatabaseCommit) {
-    res.locals.afterDatabaseCommit(() => deleteBlob(oldPath, { access: "private" }));
+    res.locals.afterDatabaseCommit(() => isCloudflare ? deleteCloudflareFileChunks(oldPath) : deleteBlob(oldPath, { access: "private" }));
   }
   res.json({ file });
 });
@@ -980,6 +1280,30 @@ app.get("/api/files/:id/download", authenticate, async (req, res) => {
     await saveDb();
     return res.status(403).json({ error: "This wallet is not authorized for the file." });
   }
+  if (file.storage === "d1" && file.storagePath) {
+    const d1 = dbContext.getStore()?.d1;
+    const encryptedSize = Number(file.encryptedSize);
+    if (!d1 || !Number.isSafeInteger(encryptedSize) || encryptedSize < 16 || encryptedSize > maximumFileSize + 16) {
+      return res.status(404).json({ error: "Encrypted file bytes were not found." });
+    }
+    res.setHeader("Content-Type", "application/octet-stream");
+    res.setHeader("Content-Length", String(encryptedSize));
+    res.setHeader("Content-Disposition", "attachment; filename=\"ciphertext.bin\"");
+    const encryptedChunks = async function* () {
+      const chunkCount = Math.ceil(encryptedSize / cloudflareFileChunkBytes);
+      for (let index = 0; index < chunkCount; index += 1) {
+        const row = await d1.prepare("SELECT payload FROM cb_secure_file_chunks WHERE storage_key = ? AND chunk_index = ?").bind(file.storagePath, index).first();
+        if (!row?.payload) throw new Error("Encrypted file chunk is missing.");
+        yield Buffer.from(row.payload);
+      }
+    };
+    const stream = Readable.from(encryptedChunks());
+    stream.on("error", () => {
+      if (!res.headersSent) res.status(404).json({ error: "Encrypted file bytes were not found." });
+      else res.destroy();
+    });
+    return stream.pipe(res);
+  }
   if (file.storage === "blob" && file.storagePath) {
     const validUntil = Date.now() + 5 * 60 * 1000;
     const signedToken = await issueSignedToken({ pathname: file.storagePath, operations: ["get"], validUntil });
@@ -1072,7 +1396,7 @@ app.post("/api/activity/record", authenticate, async (req, res) => {
 app.get("/api/notifications", authenticate, (req, res) => {
   res.json(db.activity.filter((item) => item.userEmail === req.user.email).slice(0, 20));
 });
-if (process.env.NODE_ENV === "production" && !isFunctionPlatform) {
+  if (process.env.NODE_ENV === "production" && !isFunctionPlatform && !isCloudflare) {
   const frontendDist = path.resolve(here, "../../frontend/dist");
   app.use(express.static(frontendDist, { index: false, maxAge: "1h" }));
   app.get("*", (req, res, next) => {
@@ -1086,6 +1410,6 @@ app.use((error, _req, res, _next) => {
   res.status(500).json({ error: "Unexpected server error." });
 });
 
-if (!isFunctionPlatform) app.listen(port, "0.0.0.0", () => console.log("CB SECURE service listening on port " + port));
+if (!isCloudflare && !isFunctionPlatform) app.listen(port, "0.0.0.0", () => console.log("CB SECURE service listening on port " + port));
 
 export default app;

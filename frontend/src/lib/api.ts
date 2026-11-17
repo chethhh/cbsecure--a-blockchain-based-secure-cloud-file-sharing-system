@@ -1,5 +1,3 @@
-import { upload as uploadPrivateBlob } from "@vercel/blob/client";
-
 export type User = {
   id: string;
   name: string;
@@ -13,6 +11,7 @@ export type FileRecord = {
   id: string;
   originalName: string;
   size: number;
+  encryptedSize?: number;
   mimeType: string;
   ipfsCid: string;
   sha256Hash: string;
@@ -20,7 +19,7 @@ export type FileRecord = {
   wrappedKey: string;
   wrapIv: string;
   salt: string;
-  storage: "local" | "ipfs" | "blob" | "gcs";
+  storage: "local" | "ipfs" | "blob" | "gcs" | "d1";
   ownerId: string;
   ownerEmail: string;
   ownerWallet: string | null;
@@ -67,18 +66,19 @@ type UploadTicket = { ticketId: string; pathname: string };
 
 async function uploadCiphertext(ticket: UploadTicket, encrypted: Uint8Array) {
   if (!sessionToken) throw new Error("Sign in again before uploading.");
-  await uploadPrivateBlob(
-    ticket.pathname,
-    new Blob([encrypted.slice().buffer as ArrayBuffer]),
-    {
-      access: "private",
-      contentType: "application/octet-stream",
-      handleUploadUrl: API_ROOT + "/blob/upload",
-      clientPayload: JSON.stringify({ ticketId: ticket.ticketId }),
-      headers: { Authorization: "Bearer " + sessionToken },
-      multipart: encrypted.byteLength > 10 * 1024 * 1024,
+  const response = await fetch(API_ROOT + "/blob/upload", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer " + sessionToken,
+      "Content-Type": "application/octet-stream",
+      "X-Upload-Ticket": ticket.ticketId,
     },
-  );
+    body: new Blob([encrypted.slice().buffer as ArrayBuffer], { type: "application/octet-stream" }),
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.error || "Could not upload the encrypted file.");
+  }
 }
 
 export const api = {

@@ -1,4 +1,4 @@
-const API_ORIGIN = "https://cb-secure.vercel.app";
+const API_ORIGIN = "https://cb-secure-api.chethh1.workers.dev";
 
 export async function onRequest({ request }) {
   const incomingUrl = new URL(request.url);

@@ -31,6 +31,14 @@ The activity log records registration, successful sign-ins, email OTP, and file/
 
 With no `PINATA_JWT`, encrypted bytes are stored in `backend/data/storage` and metadata in `backend/data/db.json`. Set `CB_SECURE_DATA_DIR` to move that data directory, as the Render setup does with its persistent disk. Set `PINATA_JWT` in `backend/.env` to pin ciphertext to Pinata IPFS. Never store plaintext files in the storage adapter.
 
+## Cloudflare deployment
+
+The current hosted app uses Cloudflare Pages for the React frontend, a Cloudflare Worker for the Express API, and D1 for both metadata and encrypted file chunks. `functions/api/[[path]].js` sends same-origin Pages API calls to the Worker. Apply `cloudflare/migrations/0001_create_records.sql` to the `cb-secure-db` D1 database before deploying the Worker.
+
+Set these Worker secrets with Wrangler (never commit their values): `JWT_SECRET` (32+ random characters), `CF_AUTH_PEPPER` (32+ random characters), `INITIAL_ADMIN_EMAIL`, `SMTP_USER`, and `SMTP_PASS`. Set `SMTP_HOST=smtp.gmail.com` and `SMTP_PORT=587` as Worker variables. Deploy the API with `npx wrangler deploy --config cloudflare/wrangler.jsonc`, then build and publish Pages with `npm run build` and `npx wrangler pages deploy frontend/dist --project-name cb-secure --branch cloudflare-pages`.
+
+The free D1 tier allows 500 MB per database and each encrypted file is limited to 20 MiB by the app. Files are stored as encrypted 1.8 MB chunks to stay within D1's 2 MB row limit. Cloudflare Workers Free also has a 100,000 request/day limit and a 10 ms CPU limit per request. The app uses Web Crypto PBKDF2-SHA-256 (100,000 iterations) with a Worker-only pepper for password hashes on this plan; other hosting platforms keep bcrypt. For larger storage or traffic, move file chunks to private object storage and review Cloudflare plan limits.
+
 ## Render deployment
 
 The root-level `render.yaml` deploys the frontend and Express API together as one free Node web service. Render generates `JWT_SECRET` for the service. Set `INITIAL_ADMIN_EMAIL` in the Render service environment before registering the first account; that verified account becomes the first Admin. The site and API use the same Render URL.
