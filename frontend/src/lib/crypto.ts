@@ -45,6 +45,11 @@ export type EnvelopeMetadata = {
 
 const identityCache = new Map<string, ClientIdentity>();
 
+export function resetLocalIdentity(email: string) {
+  identityCache.delete(email);
+  localStorage.removeItem("cbsecure.identity.v1." + email.toLowerCase());
+}
+
 export async function ensureIdentity(email: string, password: string): Promise<ClientIdentity> {
   const cached = identityCache.get(email);
   if (cached) return cached;

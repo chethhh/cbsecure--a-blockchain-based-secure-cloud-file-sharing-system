@@ -311,7 +311,7 @@ function createOtp() {
   return String(randomInt(0, 1_000_000)).padStart(6, "0");
 }
 
-async function deliverOtp(email, code) {
+async function deliverOtp(email, code, subject = "Your CB SECURE verification code") {
   if (process.env.RESEND_API_KEY) {
     try {
       const res = await fetch("https://api.resend.com/emails", {
@@ -323,7 +323,7 @@ async function deliverOtp(email, code) {
         body: JSON.stringify({
           from: process.env.EMAIL_FROM || "CB SECURE <onboarding@resend.dev>",
           to: [email],
-          subject: "Your CB SECURE verification code",
+          subject: subject,
           text: "Your one-time verification code is " + code + ". It expires in five minutes.",
         }),
       });
@@ -345,7 +345,7 @@ async function deliverOtp(email, code) {
         body: JSON.stringify({
           sender: { name: "CB SECURE", email: process.env.SMTP_USER || "cbsecure@gmail.com" },
           to: [{ email }],
-          subject: "Your CB SECURE verification code",
+          subject: subject,
           textContent: "Your one-time verification code is " + code + ". It expires in five minutes.",
         }),
       });
@@ -368,7 +368,7 @@ async function deliverOtp(email, code) {
   await transport.sendMail({
     from: process.env.SMTP_FROM || { name: "CB SECURE", address: process.env.SMTP_USER || "cbsecure@gmail.com" },
     to: email,
-    subject: "Your CB SECURE verification code",
+    subject: subject,
     text: "Your one-time verification code is " + code + ". It expires in five minutes.",
   });
 }
@@ -530,6 +530,86 @@ app.post("/api/auth/login", async (req, res) => {
   }
   if (!emailConfigured) return res.status(503).json({ error: "Email verification is not configured on this deployment yet." });
   return issueChallenge(user, req, res);
+});
+
+app.post("/api/auth/forgot-password", async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: "Please enter a valid email address." });
+  }
+  if (!emailConfigured) {
+    return res.status(503).json({ error: "Email verification is not configured on this deployment yet." });
+  }
+  const user = db.users.find((item) => item.email === email);
+  if (!user) {
+    return res.status(404).json({ error: "No account found with this email address." });
+  }
+
+  const code = createOtp();
+  const challenge = {
+    id: randomUUID(),
+    userId: user.id,
+    purpose: "reset-password",
+    codeHash: createHash("sha256").update(code).digest("hex"),
+    expiresAt: Date.now() + 10 * 60 * 1000,
+    attempts: 0,
+  };
+  db.challenges = db.challenges.filter((item) => item.expiresAt > Date.now() && item.userId !== user.id);
+  db.challenges.push(challenge);
+  audit("PASSWORD_RESET_REQUESTED", user, "A password reset code was requested.", req);
+  await saveDb();
+
+  console.log("==================================================");
+  console.log(`[CB SECURE OTP] Password reset code for ${user.email}: ${code}`);
+  console.log("==================================================");
+
+  try {
+    await deliverOtp(user.email, code, "Your CB SECURE password reset code");
+  } catch (error) {
+    console.error("Password reset email delivery failed:", error?.message);
+    audit("PASSWORD_RESET_SEND_FAILED", user, "Password reset email delivery failed.", req);
+    await saveDb();
+    return res.status(503).json({ error: "Could not send reset code to your inbox: " + (error?.message || "Check email service.") });
+  }
+
+  res.json({
+    challengeId: challenge.id,
+    message: "Enter the reset code sent to your email and your new password.",
+  });
+});
+
+app.post("/api/auth/reset-password", async (req, res) => {
+  const { challengeId, code, newPassword } = req.body || {};
+  if (!newPassword || newPassword.length < 10) {
+    return res.status(400).json({ error: "Your new password must be at least 10 characters long." });
+  }
+  const challenge = db.challenges.find((item) => item.id === challengeId);
+  if (!challenge || challenge.purpose !== "reset-password" || challenge.expiresAt < Date.now() || challenge.attempts >= 5) {
+    return res.status(400).json({ error: "Reset code has expired or is invalid. Please request a new one." });
+  }
+  const suppliedHash = createHash("sha256").update(String(code || "")).digest("hex");
+  if (suppliedHash !== challenge.codeHash) {
+    challenge.attempts += 1;
+    await saveDb();
+    return res.status(401).json({ error: "The verification code is incorrect." });
+  }
+
+  const user = db.users.find((item) => item.id === challenge.userId);
+  if (!user) {
+    return res.status(404).json({ error: "User account not found." });
+  }
+
+  user.passwordHash = await bcrypt.hash(newPassword, 12);
+  user.mfaVerified = true;
+  db.challenges = db.challenges.filter((item) => item.id !== challengeId);
+  audit("PASSWORD_RESET_SUCCESS", user, "Password successfully reset for " + user.email + ".", req);
+  await saveDb();
+
+  res.json({
+    token: issueToken(user),
+    user: publicUser(user),
+    message: "Password reset successfully.",
+  });
 });
 
 app.post("/api/auth/google", async (req, res) => {

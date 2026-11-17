@@ -9,12 +9,12 @@ import {
 } from "lucide-react";
 import { BrowserProvider, Contract, getAddress } from "ethers";
 import { api, type ActivityItem, type FileRecord, type GrantRecord, type SharedFile, type User, setToken } from "./lib/api";
-import { decryptFile, decryptSharedFile, ensureIdentity, encryptFile, formatBytes, replaceOwnedFileContent, replaceSharedFileContent, wrapDekForRecipient } from "./lib/crypto";
+import { decryptFile, decryptSharedFile, ensureIdentity, encryptFile, formatBytes, replaceOwnedFileContent, replaceSharedFileContent, resetLocalIdentity, wrapDekForRecipient } from "./lib/crypto";
 import metamaskFox from "./assets/metamask-fox.svg";
 import type { ClientIdentity } from "./lib/crypto";
 
 type View = "overview" | "files" | "integrity" | "activity" | "governance";
-type AuthMode = "login" | "register";
+type AuthMode = "login" | "register" | "forgot";
 type FileCategory = "all" | "images" | "documents" | "other";
 type Toast = { text: string; tone: "success" | "error" | "info" };
 const contractAddress = import.meta.env.VITE_CONTRACT_ADDRESS as string | undefined;
@@ -100,22 +100,33 @@ function AuthScreen({ onAuthenticated, initialMode, onBack }: { onAuthenticated:
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
   const [otp, setOtp] = useState("");
   const [challengeId, setChallengeId] = useState("");
   const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
   const [visible, setVisible] = useState(false);
+  const [newVisible, setNewVisible] = useState(false);
+
   async function requestCode(event: FormEvent) {
     event.preventDefault();
     setError("");
     setWorking(true);
     try {
-      const result = mode === "login"
-        ? await api.login(email, password)
-        : await api.register(name, email, password);
-      setChallengeId(result.challengeId);
-      setOtp("");
-      setStep("otp");
+      if (mode === "forgot") {
+        const result = await api.forgotPassword(email);
+        setChallengeId(result.challengeId);
+        setOtp("");
+        setNewPassword("");
+        setStep("otp");
+      } else {
+        const result = mode === "login"
+          ? await api.login(email, password)
+          : await api.register(name, email, password);
+        setChallengeId(result.challengeId);
+        setOtp("");
+        setStep("otp");
+      }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not start sign in.");
     } finally {
@@ -128,16 +139,28 @@ function AuthScreen({ onAuthenticated, initialMode, onBack }: { onAuthenticated:
     setError("");
     setWorking(true);
     try {
-      const result = await api.verifyOtp(challengeId, otp);
-      setToken(result.token);
-      try {
-        const identity: ClientIdentity = await ensureIdentity(result.user.email, password);
+      if (mode === "forgot") {
+        if (!newPassword || newPassword.length < 10) {
+          throw new Error("Your new password must be at least 10 characters long.");
+        }
+        const result = await api.resetPassword(challengeId, otp, newPassword);
+        setToken(result.token);
+        resetLocalIdentity(result.user.email);
+        const identity: ClientIdentity = await ensureIdentity(result.user.email, newPassword);
         await api.publishPublicKey(identity.publicKey);
-      } catch {
-        setToken("");
-        throw new Error("Your encryption identity could not be unlocked with this password. Check the password or clear this browser’s saved CB SECURE identity.");
+        onAuthenticated(result.user, newPassword);
+      } else {
+        const result = await api.verifyOtp(challengeId, otp);
+        setToken(result.token);
+        try {
+          const identity: ClientIdentity = await ensureIdentity(result.user.email, password);
+          await api.publishPublicKey(identity.publicKey);
+        } catch {
+          setToken("");
+          throw new Error("Your encryption identity could not be unlocked with this password. Check the password or clear this browser’s saved CB SECURE identity.");
+        }
+        onAuthenticated(result.user, password);
       }
-      onAuthenticated(result.user, password);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "The code could not be verified.");
     } finally {
@@ -175,35 +198,114 @@ function AuthScreen({ onAuthenticated, initialMode, onBack }: { onAuthenticated:
           </div>
           {step === "credentials" ? (
             <>
-          <div className="auth-heading">
-                <div className="eyebrow">WELCOME TO YOUR PRIVATE VAULT</div>
-                <h2>{mode === "login" ? "Sign in securely" : "Create your account"}</h2>
-            <p>Verify your email and unlock your encryption identity.</p>
+              <div className="auth-heading">
+                <div className="eyebrow">
+                  {mode === "forgot" ? "ACCOUNT RECOVERY" : "WELCOME TO YOUR PRIVATE VAULT"}
+                </div>
+                <h2>
+                  {mode === "forgot" ? "Reset password" : mode === "login" ? "Sign in securely" : "Create your account"}
+                </h2>
+                <p>
+                  {mode === "forgot"
+                    ? "Enter your email address to receive a one-time verification code."
+                    : "Verify your email and unlock your encryption identity."}
+                </p>
               </div>
               <form className="auth-form" onSubmit={requestCode}>
                 {mode === "register" && <label>Full name<input required value={name} onChange={(event) => setName(event.target.value)} placeholder="Your name" autoComplete="name" /></label>}
                 <label>Email address<div className="input-with-icon"><span>@</span><input required type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" autoComplete="email" /></div></label>
-                <label>Password<div className="password-wrap"><input required minLength={mode === "register" ? 10 : 1} type={visible ? "text" : "password"} value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={mode === "login" ? "current-password" : "new-password"} /><button className="input-action" type="button" aria-label={visible ? "Hide password" : "Show password"} onClick={() => setVisible(!visible)}>{visible ? <EyeOffIcon /> : <EyeIcon />}</button></div></label>
+                {mode !== "forgot" && (
+                  <label>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%" }}>
+                      <span>Password</span>
+                      {mode === "login" && (
+                        <button
+                          type="button"
+                          style={{
+                            background: "none",
+                            border: "none",
+                            padding: 0,
+                            margin: 0,
+                            color: "var(--accent, #6ee7b7)",
+                            cursor: "pointer",
+                            fontSize: "12px",
+                            fontFamily: "inherit",
+                            textDecoration: "underline",
+                            opacity: 0.9,
+                          }}
+                          onClick={() => { setMode("forgot"); setError(""); }}
+                        >
+                          Forgot password?
+                        </button>
+                      )}
+                    </div>
+                    <div className="password-wrap">
+                      <input required minLength={mode === "register" ? 10 : 1} type={visible ? "text" : "password"} value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={mode === "login" ? "current-password" : "new-password"} />
+                      <button className="input-action" type="button" aria-label={visible ? "Hide password" : "Show password"} onClick={() => setVisible(!visible)}>{visible ? <EyeOffIcon /> : <EyeIcon />}</button>
+                    </div>
+                  </label>
+                )}
                 {error && <div className="inline-error"><ShieldAlert size={15} />{error}</div>}
-                <button className="button button-primary auth-submit" disabled={working}>{working ? <span className="spinner" /> : <Fingerprint size={17} />}{working ? "Securing session…" : "Continue with email"}</button>
+                <button className="button button-primary auth-submit" disabled={working}>
+                  {working ? <span className="spinner" /> : <Fingerprint size={17} />}
+                  {working ? "Securing session…" : mode === "forgot" ? "Send reset code" : "Continue with email"}
+                </button>
               </form>
-              <div className="auth-switch"><span>{mode === "login" ? "New to CB SECURE?" : "Already have an account?"}</span><button onClick={() => { setMode(mode === "login" ? "register" : "login"); setError(""); }}> {mode === "login" ? "Create account" : "Sign in"}</button></div>
+              <div className="auth-switch">
+                {mode === "forgot" ? (
+                  <>
+                    <span>Remembered your password?</span>
+                    <button onClick={() => { setMode("login"); setError(""); }}>Sign in</button>
+                  </>
+                ) : (
+                  <>
+                    <span>{mode === "login" ? "New to CB SECURE?" : "Already have an account?"}</span>
+                    <button onClick={() => { setMode(mode === "login" ? "register" : "login"); setError(""); }}> {mode === "login" ? "Create account" : "Sign in"}</button>
+                  </>
+                )}
+              </div>
             </>
           ) : (
             <>
-              <button className="back-link" onClick={() => setStep("credentials")}>← Back to sign in</button>
+              <button className="back-link" onClick={() => { setStep("credentials"); setError(""); }}>← Back to {mode === "forgot" ? "reset request" : "sign in"}</button>
               <div className="otp-visual"><div className="otp-orbit"><Fingerprint size={30} /></div><span className="otp-check"><Check size={13} /></span></div>
               <div className="auth-heading centered">
-                <div className="eyebrow">MULTI-FACTOR VERIFICATION</div>
-                <h2>Check your inbox</h2>
-                <p>Enter the six-digit verification code sent to <strong>{email}</strong>.</p>
+                <div className="eyebrow">{mode === "forgot" ? "PASSWORD RESET" : "MULTI-FACTOR VERIFICATION"}</div>
+                <h2>{mode === "forgot" ? "Set new password" : "Check your inbox"}</h2>
+                <p>
+                  {mode === "forgot"
+                    ? <>Enter the reset code sent to <strong>{email}</strong> and choose your new password.</>
+                    : <>Enter the six-digit verification code sent to <strong>{email}</strong>.</>}
+                </p>
               </div>
               <form className="auth-form" onSubmit={verifyCode}>
                 <label>Verification code<input className="otp-input" value={otp} onChange={(event) => setOtp(event.target.value.replace(/\D/g, "").slice(0, 6))} inputMode="numeric" maxLength={6} placeholder="000000" autoComplete="one-time-code" /></label>
+                {mode === "forgot" && (
+                  <label>
+                    New password (min 10 characters)
+                    <div className="password-wrap">
+                      <input
+                        required
+                        minLength={10}
+                        type={newVisible ? "text" : "password"}
+                        value={newPassword}
+                        onChange={(event) => setNewPassword(event.target.value)}
+                        placeholder="Enter at least 10 characters"
+                        autoComplete="new-password"
+                      />
+                      <button className="input-action" type="button" aria-label={newVisible ? "Hide password" : "Show password"} onClick={() => setNewVisible(!newVisible)}>
+                        {newVisible ? <EyeOffIcon /> : <EyeIcon />}
+                      </button>
+                    </div>
+                  </label>
+                )}
                 {error && <div className="inline-error"><ShieldAlert size={15} />{error}</div>}
-                <button className="button button-primary auth-submit" disabled={working || otp.length !== 6}>{working ? <span className="spinner" /> : <ArrowRight size={17} />}{working ? "Verifying…" : "Verify and open vault"}</button>
+                <button className="button button-primary auth-submit" disabled={working || otp.length !== 6 || (mode === "forgot" && newPassword.length < 10)}>
+                  {working ? <span className="spinner" /> : <ArrowRight size={17} />}
+                  {working ? "Securing…" : mode === "forgot" ? "Reset Password & Open Vault" : "Verify and open vault"}
+                </button>
               </form>
-              <div className="auth-caption">Codes expire after 5 minutes and can only be used once.</div>
+              <div className="auth-caption">Codes expire after 10 minutes and can only be used once.</div>
             </>
           )}
           <div className="auth-legal"><span>CB SECURE <i>·</i> PRIVATE BY DESIGN</span><span>Client-side encrypted storage</span></div>

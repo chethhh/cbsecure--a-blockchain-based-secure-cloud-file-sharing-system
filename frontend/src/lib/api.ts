@@ -68,6 +68,10 @@ export const api = {
     request<{ challengeId: string; devOtp?: string; message?: string }>("/auth/register", { method: "POST", body: JSON.stringify({ name, email, password }) }),
   verifyOtp: (challengeId: string, code: string) =>
     request<{ token: string; user: User }>("/auth/verify-otp", { method: "POST", body: JSON.stringify({ challengeId, code }) }),
+  forgotPassword: (email: string) =>
+    request<{ challengeId: string; message: string }>("/auth/forgot-password", { method: "POST", body: JSON.stringify({ email }) }),
+  resetPassword: (challengeId: string, code: string, newPassword: string) =>
+    request<{ token: string; user: User; message: string }>("/auth/reset-password", { method: "POST", body: JSON.stringify({ challengeId, code, newPassword }) }),
   walletNonce: () => request<{ nonce: string }>("/auth/wallet-nonce"),
   bindWallet: (address: string, signature: string) =>
     request<{ user: User }>("/auth/verify-wallet", { method: "POST", body: JSON.stringify({ address, signature }) }),
