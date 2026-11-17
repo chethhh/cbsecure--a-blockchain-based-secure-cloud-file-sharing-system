@@ -1,3 +1,5 @@
+import { upload as uploadPrivateBlob } from "@vercel/blob/client";
+
 export type User = {
   id: string;
   name: string;
@@ -61,6 +63,24 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+type UploadTicket = { ticketId: string; pathname: string };
+
+async function uploadCiphertext(ticket: UploadTicket, encrypted: Uint8Array) {
+  if (!sessionToken) throw new Error("Sign in again before uploading.");
+  await uploadPrivateBlob(
+    ticket.pathname,
+    new Blob([encrypted.slice().buffer as ArrayBuffer]),
+    {
+      access: "private",
+      contentType: "application/octet-stream",
+      handleUploadUrl: API_ROOT + "/blob/upload",
+      clientPayload: JSON.stringify({ ticketId: ticket.ticketId }),
+      headers: { Authorization: "Bearer " + sessionToken },
+      multipart: encrypted.byteLength > 10 * 1024 * 1024,
+    },
+  );
+}
+
 export const api = {
   login: (email: string, password: string) =>
     request<{ challengeId: string }>("/auth/login", { method: "POST", body: JSON.stringify({ email, password }) }),
@@ -85,23 +105,39 @@ export const api = {
   upload: async (file: File, encrypted: Uint8Array, metadata: {
     iv: string; wrappedKey: string; wrapIv: string; salt: string; sha256Hash: string;
   }) => {
-    const form = new FormData();
-    form.append("ciphertext", new Blob([encrypted.slice().buffer as ArrayBuffer]), "ciphertext.bin");
-    form.append("originalName", file.name);
-    form.append("mimeType", file.type || "application/octet-stream");
-    form.append("size", String(file.size));
-    Object.entries(metadata).forEach(([key, value]) => form.append(key, value));
-    return request<{ file: FileRecord; message: string }>("/files/upload", { method: "POST", body: form });
+    const ticket = await request<UploadTicket>("/files/upload-ticket", {
+      method: "POST",
+      body: JSON.stringify({
+        originalName: file.name,
+        mimeType: file.type || "application/octet-stream",
+        size: file.size,
+        encryptedSize: encrypted.byteLength,
+        ...metadata,
+      }),
+    });
+    await uploadCiphertext(ticket, encrypted);
+    return request<{ file: FileRecord; message: string }>("/files/upload-finalize", {
+      method: "POST",
+      body: JSON.stringify({ ticketId: ticket.ticketId }),
+    });
   },
   replaceFile: async (id: string, file: File, encrypted: Uint8Array, metadata: { iv: string; sha256Hash: string }) => {
-    const form = new FormData();
-    form.append("ciphertext", new Blob([encrypted.slice().buffer as ArrayBuffer]), "ciphertext.bin");
-    form.append("originalName", file.name);
-    form.append("mimeType", file.type || "application/octet-stream");
-    form.append("size", String(file.size));
-    form.append("iv", metadata.iv);
-    form.append("sha256Hash", metadata.sha256Hash);
-    return request<{ file: FileRecord }>("/files/" + encodeURIComponent(id) + "/replace", { method: "PUT", body: form });
+    const ticket = await request<UploadTicket>("/files/" + encodeURIComponent(id) + "/replace-ticket", {
+      method: "POST",
+      body: JSON.stringify({
+        originalName: file.name,
+        mimeType: file.type || "application/octet-stream",
+        size: file.size,
+        encryptedSize: encrypted.byteLength,
+        iv: metadata.iv,
+        sha256Hash: metadata.sha256Hash,
+      }),
+    });
+    await uploadCiphertext(ticket, encrypted);
+    return request<{ file: FileRecord }>("/files/" + encodeURIComponent(id) + "/replace-finalize", {
+      method: "POST",
+      body: JSON.stringify({ ticketId: ticket.ticketId }),
+    });
   },
   renameFile: (id: string, originalName: string) =>
     request<{ file: FileRecord }>("/files/" + encodeURIComponent(id), { method: "PUT", body: JSON.stringify({ originalName }) }),
