@@ -49,6 +49,12 @@ const googleClientId = String(process.env.GOOGLE_CLIENT_ID || "").trim();
 const googleAuth = googleClientId ? await import("google-auth-library") : null;
 const googleClient = googleClientId ? new googleAuth.OAuth2Client(googleClientId) : null;
 const smtpConfigured = Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+const otpDeliveryUrl = String(process.env.OTP_DELIVERY_URL || "").trim();
+const otpDeliveryToken = String(process.env.OTP_DELIVERY_TOKEN || "");
+const otpDeliveryUsesHttps = /^https:\/\//i.test(otpDeliveryUrl);
+const otpDeliveryConfigured = isCloudflare
+  ? Boolean(otpDeliveryUsesHttps && otpDeliveryToken.length >= 32)
+  : smtpConfigured;
 const databaseUrl = process.env.NETLIFY_DB_URL || process.env.DATABASE_URL || process.env.POSTGRES_URL || "";
 const blobModule = isVercel ? await import("@vercel/blob") : null;
 const blobClientModule = isVercel ? await import("@vercel/blob/client") : null;
@@ -155,7 +161,8 @@ function deployedConfigurationIssues() {
     isCloudflare && cloudflareAuthPepper.length < 32 && "CF_AUTH_PEPPER",
     jwtSecret.length < 32 && "JWT_SECRET",
     !initialAdminEmail && "INITIAL_ADMIN_EMAIL",
-    (isFunctionPlatform || isCloudflare) && !smtpConfigured && "SMTP_HOST / SMTP_USER / SMTP_PASS",
+    isCloudflare && !otpDeliveryConfigured && "HTTPS OTP relay: OTP_DELIVERY_URL and OTP_DELIVERY_TOKEN",
+    isFunctionPlatform && !smtpConfigured && "SMTP_HOST / SMTP_USER / SMTP_PASS",
     isFunctionPlatform && !privateBlobConfigured && "Private Blob storage connection",
     isCloudRun && !cloudStorage && "GCS_BUCKET",
   ].filter(Boolean);
@@ -539,19 +546,49 @@ function createOtp() {
 }
 
 async function deliverOtp(email, code) {
+  if (isCloudflare) {
+    if (!otpDeliveryConfigured) throw new Error("The Cloudflare deployment needs an HTTPS OTP relay. Direct Gmail SMTP connections are unavailable from this Worker.");
+    const response = await fetch(otpDeliveryUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: otpDeliveryToken, to: email, code }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!response.ok) throw new Error("The HTTPS OTP relay returned HTTP " + response.status + ".");
+    const result = await response.json().catch(() => ({}));
+    if (result?.ok !== true) throw new Error("The HTTPS OTP relay did not confirm delivery.");
+    return;
+  }
   if (!smtpConfigured) throw new Error("Email verification is unavailable. Configure SMTP_HOST, SMTP_USER, and SMTP_PASS.");
+  const smtpHost = String(process.env.SMTP_HOST || "");
+  let connectionHost = smtpHost;
+  const tls = {};
+  if (isCloudflare) {
+    const { resolve4 } = await import("node:dns/promises");
+    const addresses = await resolve4(smtpHost);
+    if (!addresses.length) throw new Error("SMTP host did not resolve to an IPv4 address.");
+    connectionHost = addresses[0];
+    tls.servername = smtpHost;
+  }
   const transport = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
+    host: connectionHost,
     port: Number(process.env.SMTP_PORT || 587),
     secure: Number(process.env.SMTP_PORT || 587) === 465,
+    tls,
+    connectionTimeout: 15_000,
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
   });
-  await transport.sendMail({
-    from: process.env.SMTP_FROM || { name: "CB SECURE", address: process.env.SMTP_USER || "cbsecure@gmail.com" },
-    to: email,
-    subject: "Your CB SECURE verification code",
-    text: "Your one-time verification code is " + code + ". It expires in five minutes.",
-  });
+  try {
+    await transport.sendMail({
+      from: process.env.SMTP_FROM || { name: "CB SECURE", address: process.env.SMTP_USER || "cbsecure@gmail.com" },
+      to: email,
+      subject: "Your CB SECURE verification code",
+      text: "Your one-time verification code is " + code + ". It expires in five minutes.",
+    });
+  } catch (error) {
+    if (isCloudflare && error && typeof error === "object") error.smtpDestination = connectionHost;
+    throw error;
+  }
 }
 
 async function issueChallenge(user, req, res, status = 200) {
@@ -566,20 +603,29 @@ async function issueChallenge(user, req, res, status = 200) {
   };
   db.challenges = db.challenges.filter((item) => item.expiresAt > Date.now() && item.userId !== user.id);
   db.challenges.push(challenge);
-  audit("OTP_SENT", user, "A one-time verification code was issued.", req);
   await saveDb();
   try {
     await deliverOtp(user.email, code);
   } catch (error) {
     console.error("OTP email delivery failed.", {
       code: typeof error?.code === "string" ? error.code : "UNKNOWN",
+      message: typeof error?.message === "string" ? error.message.replace(/[\r\n]+/g, " ").slice(0, 180) : undefined,
       responseCode: Number.isInteger(error?.responseCode) ? error.responseCode : undefined,
       command: typeof error?.command === "string" ? error.command : undefined,
+      syscall: typeof error?.syscall === "string" ? error.syscall : undefined,
+      hostname: typeof error?.hostname === "string" ? error.hostname : undefined,
+      address: typeof error?.address === "string" ? error.address : undefined,
+      port: Number.isInteger(error?.port) ? error.port : undefined,
+      destination: typeof error?.smtpDestination === "string" ? error.smtpDestination : undefined,
     });
+    db.challenges = db.challenges.filter((item) => item.id !== challenge.id);
+    if (status === 201) db.users = db.users.filter((item) => item.id !== user.id);
     audit("OTP_SEND_FAILED", user, "Verification email delivery failed for " + user.email + ".", req);
     await saveDb();
     return res.status(503).json({ error: "Could not send the verification email. Check the SMTP settings." });
   }
+  audit("OTP_SENT", user, "A one-time verification code was issued.", req);
+  await saveDb();
   res.status(status).json({
     challengeId: challenge.id,
     message: "Enter the six-digit code to continue.",
@@ -672,7 +718,7 @@ app.get("/api/health", (_req, res) => {
       sha256: true,
       database: Boolean(databasePool) || (isCloudflare && process.env.CF_D1_ACTIVE === "true"),
       durableMetadata: Boolean(databasePool) || (isCloudflare && process.env.CF_D1_ACTIVE === "true"),
-      emailOtp: smtpConfigured,
+      emailOtp: otpDeliveryConfigured,
       privateBlobStorage: privateBlobConfigured,
       cloudflareD1FileStorage: isCloudflare && process.env.CF_D1_ACTIVE === "true",
       directUploads: privateBlobConfigured || (isCloudflare && process.env.CF_D1_ACTIVE === "true"),
@@ -690,7 +736,13 @@ app.post("/api/auth/register", async (req, res) => {
     return res.status(400).json({ error: "Provide a name, valid email, and password of at least 10 characters." });
   }
   if (!smtpConfigured) return res.status(503).json({ error: "Email verification is not configured on this deployment yet." });
-  if (db.users.some((user) => user.email === normalizedEmail)) return res.status(409).json({ error: "An account with that email already exists." });
+  const existingUser = db.users.find((user) => user.email === normalizedEmail);
+  if (existingUser?.mfaVerified) return res.status(409).json({ error: "An account with that email already exists." });
+  if (existingUser) {
+    db.challenges = db.challenges.filter((item) => item.userId !== existingUser.id);
+    db.users = db.users.filter((item) => item.id !== existingUser.id);
+    await saveDb();
+  }
   const passwordHash = await hashPassword(password);
   const hasAdmin = db.users.some((item) => item.role === "Admin");
   const isConfiguredAdmin = initialAdminEmail && normalizedEmail === initialAdminEmail;
