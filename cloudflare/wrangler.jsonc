@@ -5,6 +5,8 @@
   "compatibility_date": "2026-11-17",
   "compatibility_flags": ["nodejs_compat", "nodejs_compat_populate_process_env"],
   "workers_dev": true,
+  // Configure RESEND_API_KEY and RESEND_FROM_EMAIL as Worker secrets after
+  // adding a Resend API key and verifying the sender domain. Never commit them.
   "vars": {
     "CF_WORKERS": "true",
     "CF_D1_ACTIVE": "true",

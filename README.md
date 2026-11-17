@@ -12,11 +12,11 @@ Copy-Item .env.example backend/.env
 npm run dev
 ```
 
-Open [http://localhost:5173](http://localhost:5173). Before the first registration, edit `backend/.env`: set a random `JWT_SECRET` with at least 32 characters, set `INITIAL_ADMIN_EMAIL` to your account email, and configure SMTP as described below. The verified account matching `INITIAL_ADMIN_EMAIL` becomes the first Admin. Other new accounts start as Viewers.
+Open [http://localhost:5173](http://localhost:5173). Before the first registration, edit `backend/.env`: set a random `JWT_SECRET` with at least 32 characters, set `INITIAL_ADMIN_EMAIL` to your account email, and configure Resend as described below. The verified account matching `INITIAL_ADMIN_EMAIL` becomes the first Admin.
 
 ## Real email verification codes
 
-Email/password registration and sign-in send a random, single-use code that expires after five minutes. There is no fixed OTP or in-app OTP bypass. Configure a Gmail App Password for `cbsecure@gmail.com` in `backend/.env` (`SMTP_USER`, `SMTP_PASS`) and set `SMTP_FROM=CB SECURE <cbsecure@gmail.com>`. Gmail requires 2-Step Verification before you can create an App Password ([Google instructions](https://support.google.com/accounts/answer/185833)). Use the authenticated Gmail address as the sender or a verified Gmail alias.
+Email/password registration and sign-in send a random, single-use six-digit code that expires after five minutes. There is no fixed OTP or in-app OTP bypass. Set `RESEND_API_KEY` in the backend environment and `RESEND_FROM_EMAIL` to `CB SECURE <otp@your-verified-domain.com>`. The API key stays on the backend and must never be added to frontend variables. Verify the sender domain in Resend before using it for users; personal Gmail addresses cannot be used as arbitrary verified sending domains. OTP delivery uses Resend over HTTPS and is rate-limited to five issued attempts per address per hour, in addition to the authentication IP limit.
 
 ## Access roles
 
@@ -35,7 +35,7 @@ With no `PINATA_JWT`, encrypted bytes are stored in `backend/data/storage` and m
 
 The current hosted app uses Cloudflare Pages for the React frontend, a Cloudflare Worker for the Express API, and D1 for both metadata and encrypted file chunks. `functions/api/[[path]].js` sends same-origin Pages API calls to the Worker. Apply `cloudflare/migrations/0001_create_records.sql` to the `cb-secure-db` D1 database before deploying the Worker.
 
-Set these Worker secrets with Wrangler (never commit their values): `JWT_SECRET` (32+ random characters), `CF_AUTH_PEPPER` (32+ random characters), `INITIAL_ADMIN_EMAIL`, `OTP_DELIVERY_URL`, and `OTP_DELIVERY_TOKEN` (32+ random characters). `cloudflare/google-apps-script/Code.gs` is the HTTPS mail bridge: create a Google Apps Script project under the Gmail account you want to send from, paste the file, set `OTP_RELAY_TOKEN` in its Script Properties to the same random token, and deploy it as a Web app executing as your account with access set to anyone. Approve the requested Gmail sending scope when Google prompts. Add the resulting `/exec` URL as `OTP_DELIVERY_URL` and the matching token as `OTP_DELIVERY_TOKEN` in the Cloudflare Worker secrets. This keeps Gmail credentials out of the Worker; the relay sends only six-digit OTPs, and validates a shared token before sending. Cloudflare Workers cannot connect to Gmail's public SMTP endpoint in production, so direct SMTP is not used there. Local development and non-Cloudflare hosting continue to use SMTP.
+Set these Worker values in Cloudflare (never commit their values): `JWT_SECRET` (32+ random characters), `CF_AUTH_PEPPER` (32+ random characters), `INITIAL_ADMIN_EMAIL`, `RESEND_API_KEY`, and `RESEND_FROM_EMAIL`. Add them under Workers & Pages → `cb-secure-api` → Settings → Variables and Secrets, then deploy the Worker. Create the API key in Resend, and set the sender to an address on a domain verified in your Resend account. The Worker calls `https://api.resend.com/emails` directly using HTTPS; no Gmail SMTP server or Apps Script bridge is used. OTP values and API credentials are never written to logs.
 
 Deploy the API with `npx wrangler deploy --config cloudflare/wrangler.jsonc`, then build and publish Pages with `npm run build` and `npx wrangler pages deploy frontend/dist --project-name cb-secure --branch cloudflare-pages`.
 
@@ -45,7 +45,7 @@ The free D1 tier allows 500 MB per database and each encrypted file is limited t
 
 The root-level `render.yaml` deploys the frontend and Express API together as one free Node web service. Render generates `JWT_SECRET` for the service. Set `INITIAL_ADMIN_EMAIL` in the Render service environment before registering the first account; that verified account becomes the first Admin. The site and API use the same Render URL.
 
-Render Free is suitable for a temporary preview, not durable vault storage. Its web service filesystem is ephemeral and is cleared when the service spins down, restarts, or redeploys. Free web services also cannot send outbound SMTP over ports 25, 465, or 587, so Gmail SMTP OTP delivery will not work there. Until an email provider reachable over HTTPS or an allowed port is configured, email/password registration and sign-in return a setup error. Free Render Postgres expires 30 days after creation. See [Render Free instance limits](https://render.com/docs/free).
+Render Free is suitable for a temporary preview, not durable vault storage. Its web service filesystem is ephemeral and is cleared when the service spins down, restarts, or redeploys. Configure the same Resend API key and verified sender address for email/password registration and sign-in. Free Render Postgres expires 30 days after creation. See [Render Free instance limits](https://render.com/docs/free).
 
 Do not store real user files or accounts on this temporary Free deployment. It stores local metadata and ciphertext on the service filesystem, which can be lost. For durable use, move metadata to a persistent database and encrypted file bytes to durable object storage, then configure an email delivery provider.
 

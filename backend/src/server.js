@@ -6,7 +6,6 @@ import helmet from "helmet";
 import multer from "multer";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import nodemailer from "nodemailer";
 import { OAuth2Client } from "google-auth-library";
 import { randomInt, createHash, randomUUID, randomBytes } from "node:crypto";
 import { mkdir, readFile, writeFile, unlink } from "node:fs/promises";
@@ -48,13 +47,11 @@ const cloudflarePasswordHashPrefix = "cf-pbkdf2-sha256";
 const googleClientId = String(process.env.GOOGLE_CLIENT_ID || "").trim();
 const googleAuth = googleClientId ? await import("google-auth-library") : null;
 const googleClient = googleClientId ? new googleAuth.OAuth2Client(googleClientId) : null;
-const smtpConfigured = Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
-const otpDeliveryUrl = String(process.env.OTP_DELIVERY_URL || "").trim();
-const otpDeliveryToken = String(process.env.OTP_DELIVERY_TOKEN || "");
-const otpDeliveryUsesHttps = /^https:\/\//i.test(otpDeliveryUrl);
-const otpDeliveryConfigured = isCloudflare
-  ? Boolean(otpDeliveryUsesHttps && otpDeliveryToken.length >= 32)
-  : smtpConfigured;
+const resendApiKey = String(process.env.RESEND_API_KEY || "").trim();
+const resendFromEmail = String(process.env.RESEND_FROM_EMAIL || "").trim();
+const resendSenderConfigured = /^(?:[^<>\r\n]*<[^<>\s@]+@[^<>\s@]+\.[^<>\s@]+>|[^<>\s@]+@[^<>\s@]+\.[^<>\s@]+)$/.test(resendFromEmail)
+  && !/(?:your-verified-domain\.com|@example\.(?:com|net|org)|@[^<>\s@]+\.(?:example|invalid|test)(?:>|$))/i.test(resendFromEmail);
+const emailDeliveryConfigured = resendApiKey.length >= 20 && resendSenderConfigured;
 const databaseUrl = process.env.NETLIFY_DB_URL || process.env.DATABASE_URL || process.env.POSTGRES_URL || "";
 const blobModule = isVercel ? await import("@vercel/blob") : null;
 const blobClientModule = isVercel ? await import("@vercel/blob/client") : null;
@@ -161,8 +158,8 @@ function deployedConfigurationIssues() {
     isCloudflare && cloudflareAuthPepper.length < 32 && "CF_AUTH_PEPPER",
     jwtSecret.length < 32 && "JWT_SECRET",
     !initialAdminEmail && "INITIAL_ADMIN_EMAIL",
-    isCloudflare && !otpDeliveryConfigured && "HTTPS OTP relay: OTP_DELIVERY_URL and OTP_DELIVERY_TOKEN",
-    isFunctionPlatform && !smtpConfigured && "SMTP_HOST / SMTP_USER / SMTP_PASS",
+    (isServerless || isRender) && resendApiKey.length < 20 && "RESEND_API_KEY (Cloudflare Worker secret)",
+    (isServerless || isRender) && !resendSenderConfigured && "RESEND_FROM_EMAIL (address on a verified Resend domain)",
     isFunctionPlatform && !privateBlobConfigured && "Private Blob storage connection",
     isCloudRun && !cloudStorage && "GCS_BUCKET",
   ].filter(Boolean);
@@ -190,6 +187,9 @@ function privateStorageConfigured() {
 const cloudflareFileChunkBytes = 1_800_000;
 const cloudflareFileChunkBatchSize = 8;
 const authRateLimitState = new Map();
+const otpRateWindowMs = 60 * 60 * 1000;
+const otpRateLimitPerEmail = 5;
+const otpTtlMs = 5 * 60 * 1000;
 
 function encodeBase64Url(bytes) {
   let binary = "";
@@ -545,84 +545,120 @@ function createOtp() {
   return String(randomInt(0, 1_000_000)).padStart(6, "0");
 }
 
-async function deliverOtp(email, code) {
-  if (isCloudflare) {
-    if (!otpDeliveryConfigured) throw new Error("The Cloudflare deployment needs an HTTPS OTP relay. Direct Gmail SMTP connections are unavailable from this Worker.");
-    const response = await fetch(otpDeliveryUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token: otpDeliveryToken, to: email, code }),
-      signal: AbortSignal.timeout(20_000),
-    });
-    if (!response.ok) throw new Error("The HTTPS OTP relay returned HTTP " + response.status + ".");
-    const result = await response.json().catch(() => ({}));
-    if (result?.ok !== true) throw new Error("The HTTPS OTP relay did not confirm delivery.");
-    return;
-  }
-  if (!smtpConfigured) throw new Error("Email verification is unavailable. Configure SMTP_HOST, SMTP_USER, and SMTP_PASS.");
-  const smtpHost = String(process.env.SMTP_HOST || "");
-  let connectionHost = smtpHost;
-  const tls = {};
-  if (isCloudflare) {
-    const { resolve4 } = await import("node:dns/promises");
-    const addresses = await resolve4(smtpHost);
-    if (!addresses.length) throw new Error("SMTP host did not resolve to an IPv4 address.");
-    connectionHost = addresses[0];
-    tls.servername = smtpHost;
-  }
-  const transport = nodemailer.createTransport({
-    host: connectionHost,
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: Number(process.env.SMTP_PORT || 587) === 465,
-    tls,
-    connectionTimeout: 15_000,
-    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-  });
+async function deliverOtp(email, code, expiresAt, challengeId) {
+  if (!emailDeliveryConfigured) throw new Error("Email verification is unavailable. Configure RESEND_API_KEY and RESEND_FROM_EMAIL.");
+
+  const expirationLabel = new Date(expiresAt).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC");
+  const subject = "Your CB SECURE verification code";
+  const text = [
+    "CB SECURE email verification",
+    "Your one-time verification code is " + code + ".",
+    "This code expires at " + expirationLabel + " (in five minutes) and can only be used once.",
+    "If you did not request this code, you can ignore this email.",
+  ].join("\n\n");
+  const html = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;background:#f3f6fa;font-family:Arial,Helvetica,sans-serif;color:#152238">
+  <div style="max-width:560px;margin:32px auto;padding:0 16px">
+    <div style="background:#ffffff;border:1px solid #e5eaf1;border-radius:18px;overflow:hidden">
+      <div style="padding:28px 32px;background:#101b2d;color:#ffffff">
+        <div style="font-size:12px;font-weight:700;letter-spacing:2px;color:#a8c8ff">CB SECURE</div>
+        <h1 style="font-size:24px;line-height:1.25;margin:18px 0 0">Verify your email</h1>
+      </div>
+      <div style="padding:32px">
+        <p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#42516a">Use this one-time code to continue securely:</p>
+        <div style="padding:18px 16px;background:#f3f6fa;border:1px solid #e5eaf1;border-radius:12px;text-align:center;font-size:34px;font-weight:700;letter-spacing:10px;color:#13233b">${code}</div>
+        <p style="margin:20px 0 0;font-size:14px;line-height:1.6;color:#42516a">Expires at <strong>${expirationLabel}</strong>. This code can only be used once.</p>
+        <p style="margin:20px 0 0;font-size:13px;line-height:1.6;color:#718096">If you did not request this code, you can safely ignore this message.</p>
+      </div>
+    </div>
+    <p style="margin:18px 0 0;text-align:center;font-size:12px;color:#8995a6">CB SECURE · Private file access, verified.</p>
+  </div>
+</body></html>`;
+
+  let response;
   try {
-    await transport.sendMail({
-      from: process.env.SMTP_FROM || { name: "CB SECURE", address: process.env.SMTP_USER || "cbsecure@gmail.com" },
-      to: email,
-      subject: "Your CB SECURE verification code",
-      text: "Your one-time verification code is " + code + ". It expires in five minutes.",
+    response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + resendApiKey,
+        "Content-Type": "application/json",
+        "Idempotency-Key": "cb-secure-otp/" + challengeId,
+      },
+      body: JSON.stringify({ from: resendFromEmail, to: [email], subject, text, html }),
+      signal: AbortSignal.timeout(15_000),
     });
   } catch (error) {
-    if (isCloudflare && error && typeof error === "object") error.smtpDestination = connectionHost;
-    throw error;
+    const deliveryError = new Error("Resend API request failed.");
+    deliveryError.provider = "resend";
+    deliveryError.providerCode = ["AbortError", "TimeoutError"].includes(error?.name) ? "TIMEOUT" : "NETWORK_ERROR";
+    throw deliveryError;
   }
+
+  if (!response.ok) {
+    const responseBody = await response.json().catch(() => ({}));
+    const deliveryError = new Error("Resend rejected the email request.");
+    deliveryError.provider = "resend";
+    deliveryError.responseStatus = response.status;
+    deliveryError.providerCode = typeof responseBody?.name === "string" ? responseBody.name.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 60) : "API_ERROR";
+    throw deliveryError;
+  }
+
+  const result = await response.json().catch(() => ({}));
+  if (typeof result?.id !== "string" || !result.id) {
+    const deliveryError = new Error("Resend response did not include an email id.");
+    deliveryError.provider = "resend";
+    deliveryError.responseStatus = response.status;
+    deliveryError.providerCode = "INVALID_RESPONSE";
+    throw deliveryError;
+  }
+  return result.id;
+}
+
+function otpRateLimitRetryAfter(email, now = Date.now()) {
+  const sentAttempts = db.activity
+    .filter((entry) => String(entry.userEmail || "").toLowerCase() === email.toLowerCase() && ["OTP_SENT", "OTP_SEND_FAILED"].includes(entry.action))
+    .map((entry) => Date.parse(entry.timestamp))
+    .filter((timestamp) => Number.isFinite(timestamp) && timestamp > now - otpRateWindowMs)
+    .sort((a, b) => a - b);
+  if (sentAttempts.length < otpRateLimitPerEmail) return 0;
+  return Math.max(1, Math.ceil((sentAttempts[sentAttempts.length - otpRateLimitPerEmail] + otpRateWindowMs - now) / 1000));
 }
 
 async function issueChallenge(user, req, res, status = 200) {
+  const retryAfter = otpRateLimitRetryAfter(user.email);
+  if (retryAfter) {
+    audit("OTP_RATE_LIMITED", user, "OTP request rate limit reached for this email address.", req);
+    await saveDb();
+    res.setHeader("Retry-After", String(retryAfter));
+    return res.status(429).json({ error: "Too many verification emails requested. Try again later." });
+  }
+
   const code = createOtp();
   const challenge = {
     id: randomUUID(),
     userId: user.id,
     purpose: status === 201 ? "register" : "login",
     codeHash: createHash("sha256").update(code).digest("hex"),
-    expiresAt: Date.now() + 5 * 60 * 1000,
+    expiresAt: Date.now() + otpTtlMs,
     attempts: 0,
   };
   db.challenges = db.challenges.filter((item) => item.expiresAt > Date.now() && item.userId !== user.id);
   db.challenges.push(challenge);
   await saveDb();
   try {
-    await deliverOtp(user.email, code);
+    await deliverOtp(user.email, code, challenge.expiresAt, challenge.id);
   } catch (error) {
     console.error("OTP email delivery failed.", {
-      code: typeof error?.code === "string" ? error.code : "UNKNOWN",
-      message: typeof error?.message === "string" ? error.message.replace(/[\r\n]+/g, " ").slice(0, 180) : undefined,
-      responseCode: Number.isInteger(error?.responseCode) ? error.responseCode : undefined,
-      command: typeof error?.command === "string" ? error.command : undefined,
-      syscall: typeof error?.syscall === "string" ? error.syscall : undefined,
-      hostname: typeof error?.hostname === "string" ? error.hostname : undefined,
-      address: typeof error?.address === "string" ? error.address : undefined,
-      port: Number.isInteger(error?.port) ? error.port : undefined,
-      destination: typeof error?.smtpDestination === "string" ? error.smtpDestination : undefined,
+      provider: error?.provider || "resend",
+      providerCode: error?.providerCode || "UNKNOWN",
+      responseStatus: Number.isInteger(error?.responseStatus) ? error.responseStatus : undefined,
     });
     db.challenges = db.challenges.filter((item) => item.id !== challenge.id);
     if (status === 201) db.users = db.users.filter((item) => item.id !== user.id);
     audit("OTP_SEND_FAILED", user, "Verification email delivery failed for " + user.email + ".", req);
     await saveDb();
-    return res.status(503).json({ error: "Could not send the verification email. Check the SMTP settings." });
+    return res.status(503).json({ error: "Could not send the verification email. Check the email delivery configuration." });
   }
   audit("OTP_SENT", user, "A one-time verification code was issued.", req);
   await saveDb();
@@ -718,7 +754,7 @@ app.get("/api/health", (_req, res) => {
       sha256: true,
       database: Boolean(databasePool) || (isCloudflare && process.env.CF_D1_ACTIVE === "true"),
       durableMetadata: Boolean(databasePool) || (isCloudflare && process.env.CF_D1_ACTIVE === "true"),
-      emailOtp: otpDeliveryConfigured,
+      emailOtp: emailDeliveryConfigured,
       privateBlobStorage: privateBlobConfigured,
       cloudflareD1FileStorage: isCloudflare && process.env.CF_D1_ACTIVE === "true",
       directUploads: privateBlobConfigured || (isCloudflare && process.env.CF_D1_ACTIVE === "true"),
@@ -735,7 +771,7 @@ app.post("/api/auth/register", async (req, res) => {
   if (!name?.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail) || !password || password.length < 10) {
     return res.status(400).json({ error: "Provide a name, valid email, and password of at least 10 characters." });
   }
-  if (!smtpConfigured) return res.status(503).json({ error: "Email verification is not configured on this deployment yet." });
+  if (!emailDeliveryConfigured) return res.status(503).json({ error: "Email verification is not configured on this deployment yet." });
   const existingUser = db.users.find((user) => user.email === normalizedEmail);
   if (existingUser?.mfaVerified) return res.status(409).json({ error: "An account with that email already exists." });
   if (existingUser) {
@@ -762,7 +798,7 @@ app.post("/api/auth/login", async (req, res) => {
     await saveDb();
     return res.status(401).json({ error: "Email or password is incorrect." });
   }
-  if (!smtpConfigured) return res.status(503).json({ error: "Email verification is not configured on this deployment yet." });
+  if (!emailDeliveryConfigured) return res.status(503).json({ error: "Email verification is not configured on this deployment yet." });
   return issueChallenge(user, req, res);
 });
 
