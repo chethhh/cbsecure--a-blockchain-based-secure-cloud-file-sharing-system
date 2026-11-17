@@ -57,7 +57,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(API_ROOT + path, { ...init, headers });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
-    throw new Error(body.error || "Request failed (" + response.status + ").");
+    const missing = Array.isArray(body.missing) && body.missing.length
+      ? " Missing setup: " + body.missing.join(", ") + "."
+      : "";
+    throw new Error((body.error || "Request failed (" + response.status + ").") + missing);
   }
   return response.json() as Promise<T>;
 }
