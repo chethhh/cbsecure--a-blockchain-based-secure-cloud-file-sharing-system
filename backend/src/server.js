@@ -312,6 +312,9 @@ function createOtp() {
 }
 
 async function deliverOtp(email, code, subject = "Your CB SECURE verification code") {
+  let resendBlockedForNonOwner = false;
+  let resendErrorMessage = "";
+
   if (process.env.RESEND_API_KEY) {
     try {
       const res = await fetch("https://api.resend.com/emails", {
@@ -327,8 +330,14 @@ async function deliverOtp(email, code, subject = "Your CB SECURE verification co
           text: "Your one-time verification code is " + code + ". It expires in five minutes.",
         }),
       });
-      if (res.ok) return;
-      console.warn("Resend API delivery failed, trying SMTP fallback...");
+      if (res.ok) return { deliveredTo: email };
+
+      const resendErr = await res.json().catch(() => ({}));
+      resendErrorMessage = resendErr?.message || "";
+      if (res.status === 403 && resendErrorMessage.toLowerCase().includes("only send testing emails to your own email address")) {
+        resendBlockedForNonOwner = true;
+      }
+      console.warn("Resend API warning:", res.status, resendErrorMessage);
     } catch (err) {
       console.warn("Resend error:", err?.message);
     }
@@ -343,16 +352,55 @@ async function deliverOtp(email, code, subject = "Your CB SECURE verification co
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          sender: { name: "CB SECURE", email: process.env.SMTP_USER || "cbsecure@gmail.com" },
+          sender: { name: "CB SECURE", email: process.env.BREVO_SENDER || process.env.SMTP_USER || "chethh1@gmail.com" },
           to: [{ email }],
           subject: subject,
           textContent: "Your one-time verification code is " + code + ". It expires in five minutes.",
         }),
       });
-      if (res.ok) return;
+      if (res.ok) return { deliveredTo: email };
+      const brevoErr = await res.json().catch(() => ({}));
+      console.warn("Brevo API warning:", brevoErr);
     } catch (err) {
       console.warn("Brevo error:", err?.message);
     }
+  }
+
+  // If Resend failed because it is a testing sandbox that only sends to the owner's email address,
+  // forward the verification code to the registered owner (initialAdminEmail) so testing is never blocked
+  if (resendBlockedForNonOwner && process.env.RESEND_API_KEY && initialAdminEmail && email !== initialAdminEmail) {
+    try {
+      const forwardRes = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer " + process.env.RESEND_API_KEY,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: process.env.EMAIL_FROM || "CB SECURE <onboarding@resend.dev>",
+          to: [initialAdminEmail],
+          subject: `[CB SECURE Demo] Verification code for ${email}`,
+          text: `Verification code for "${email}" is: ${code}.\n\n(Forwarded to ${initialAdminEmail} because Resend testing mode only delivers to the owner. To deliver directly to any recipient, add a free Brevo API key or verify a custom domain on Resend.)`,
+        }),
+      });
+      if (forwardRes.ok) {
+        console.log(`[Resend Test Mode] Forwarded code for ${email} to admin ${initialAdminEmail}`);
+        return {
+          deliveredTo: initialAdminEmail,
+          forwardedFor: email,
+        };
+      }
+    } catch (forwardErr) {
+      console.warn("Failed forwarding code to admin:", forwardErr?.message);
+    }
+  }
+
+  // On Render Free tier, outbound SMTP ports (25, 465, 587) are firewalled. Skip Nodemailer to avoid 8-second hang.
+  if (isRender) {
+    if (resendBlockedForNonOwner) {
+      throw new Error(`Resend test mode only delivers to ${initialAdminEmail || "your registered email"}. To deliver directly to any email address, add a free Brevo API key (brevo.com) or verify a domain on Resend.`);
+    }
+    throw new Error(resendErrorMessage || "Email delivery failed via API and SMTP ports are blocked on Render Free.");
   }
 
   if (!smtpConfigured) throw new Error("Email delivery is unavailable. Configure SMTP_HOST/SMTP_USER/SMTP_PASS or RESEND_API_KEY.");
@@ -371,6 +419,7 @@ async function deliverOtp(email, code, subject = "Your CB SECURE verification co
     subject: subject,
     text: "Your one-time verification code is " + code + ". It expires in five minutes.",
   });
+  return { deliveredTo: email };
 }
 
 async function issueChallenge(user, req, res, status = 200) {
@@ -392,8 +441,9 @@ async function issueChallenge(user, req, res, status = 200) {
   console.log(`[CB SECURE OTP] Code for ${user.email}: ${code}`);
   console.log("==================================================");
 
+  let delivery;
   try {
-    await deliverOtp(user.email, code);
+    delivery = await deliverOtp(user.email, code);
   } catch (error) {
     console.error("OTP email delivery failed:", error?.message);
     audit("OTP_SEND_FAILED", user, "Verification email delivery failed for " + user.email + ".", req);
@@ -403,7 +453,9 @@ async function issueChallenge(user, req, res, status = 200) {
 
   res.status(status).json({
     challengeId: challenge.id,
-    message: "Enter the six-digit code sent to your email inbox.",
+    message: delivery?.forwardedFor
+      ? `Notice: Resend sandbox only sends to owner. Code for ${user.email} was sent to ${delivery.deliveredTo}.`
+      : "Enter the six-digit code sent to your email inbox.",
   });
 }
 
@@ -563,8 +615,9 @@ app.post("/api/auth/forgot-password", async (req, res) => {
   console.log(`[CB SECURE OTP] Password reset code for ${user.email}: ${code}`);
   console.log("==================================================");
 
+  let delivery;
   try {
-    await deliverOtp(user.email, code, "Your CB SECURE password reset code");
+    delivery = await deliverOtp(user.email, code, "Your CB SECURE password reset code");
   } catch (error) {
     console.error("Password reset email delivery failed:", error?.message);
     audit("PASSWORD_RESET_SEND_FAILED", user, "Password reset email delivery failed.", req);
@@ -574,7 +627,9 @@ app.post("/api/auth/forgot-password", async (req, res) => {
 
   res.json({
     challengeId: challenge.id,
-    message: "Enter the reset code sent to your email and your new password.",
+    message: delivery?.forwardedFor
+      ? `Notice: Resend sandbox only sends to owner. Reset code for ${user.email} was sent to ${delivery.deliveredTo}.`
+      : "Enter the reset code sent to your email and your new password.",
   });
 });
 

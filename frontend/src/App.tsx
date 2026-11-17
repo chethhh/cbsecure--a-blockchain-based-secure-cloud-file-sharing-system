@@ -105,17 +105,22 @@ function AuthScreen({ onAuthenticated, initialMode, onBack }: { onAuthenticated:
   const [challengeId, setChallengeId] = useState("");
   const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
+  const [noticeMessage, setNoticeMessage] = useState("");
   const [visible, setVisible] = useState(false);
   const [newVisible, setNewVisible] = useState(false);
 
   async function requestCode(event: FormEvent) {
     event.preventDefault();
     setError("");
+    setNoticeMessage("");
     setWorking(true);
     try {
       if (mode === "forgot") {
         const result = await api.forgotPassword(email);
         setChallengeId(result.challengeId);
+        if (result.message && result.message.includes("Notice:")) {
+          setNoticeMessage(result.message);
+        }
         setOtp("");
         setNewPassword("");
         setStep("otp");
@@ -124,6 +129,9 @@ function AuthScreen({ onAuthenticated, initialMode, onBack }: { onAuthenticated:
           ? await api.login(email, password)
           : await api.register(name, email, password);
         setChallengeId(result.challengeId);
+        if (result.message && result.message.includes("Notice:")) {
+          setNoticeMessage(result.message);
+        }
         setOtp("");
         setStep("otp");
       }
@@ -278,6 +286,11 @@ function AuthScreen({ onAuthenticated, initialMode, onBack }: { onAuthenticated:
                     : <>Enter the six-digit verification code sent to <strong>{email}</strong>.</>}
                 </p>
               </div>
+              {noticeMessage && (
+                <div style={{ margin: "10px 0 16px", padding: "10px 14px", borderRadius: "10px", background: "rgba(56, 189, 248, 0.12)", border: "1px solid rgba(56, 189, 248, 0.28)", color: "#bae6fd", fontSize: "13px", textAlign: "center", lineHeight: "1.4" }}>
+                  {noticeMessage}
+                </div>
+              )}
               <form className="auth-form" onSubmit={verifyCode}>
                 <label>Verification code<input className="otp-input" value={otp} onChange={(event) => setOtp(event.target.value.replace(/\D/g, "").slice(0, 6))} inputMode="numeric" maxLength={6} placeholder="000000" autoComplete="one-time-code" /></label>
                 {mode === "forgot" && (
