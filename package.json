@@ -1,6 +1,7 @@
 {
   "name": "cb-secure",
   "private": true,
+  "type": "module",
   "version": "0.1.0",
   "description": "Client-encrypted decentralized file sharing",
   "workspaces": ["frontend", "backend"],
@@ -18,4 +19,3 @@
     "concurrently": "^9.1.2"
   }
 }
-
