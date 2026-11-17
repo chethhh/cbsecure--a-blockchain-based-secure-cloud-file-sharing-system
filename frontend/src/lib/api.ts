@@ -83,9 +83,9 @@ async function uploadCiphertext(ticket: UploadTicket, encrypted: Uint8Array) {
 
 export const api = {
   login: (email: string, password: string) =>
-    request<{ challengeId: string }>("/auth/login", { method: "POST", body: JSON.stringify({ email, password }) }),
+    request<{ challengeId: string; devOtp?: string; message?: string }>("/auth/login", { method: "POST", body: JSON.stringify({ email, password }) }),
   register: (name: string, email: string, password: string) =>
-    request<{ challengeId: string }>("/auth/register", { method: "POST", body: JSON.stringify({ name, email, password }) }),
+    request<{ challengeId: string; devOtp?: string; message?: string }>("/auth/register", { method: "POST", body: JSON.stringify({ name, email, password }) }),
   verifyOtp: (challengeId: string, code: string) =>
     request<{ token: string; user: User }>("/auth/verify-otp", { method: "POST", body: JSON.stringify({ challengeId, code }) }),
   walletNonce: () => request<{ nonce: string }>("/auth/wallet-nonce"),

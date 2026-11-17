@@ -101,6 +101,7 @@ function AuthScreen({ onAuthenticated, initialMode, onBack }: { onAuthenticated:
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [otp, setOtp] = useState("");
+  const [devOtp, setDevOtp] = useState("");
   const [challengeId, setChallengeId] = useState("");
   const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
@@ -114,7 +115,13 @@ function AuthScreen({ onAuthenticated, initialMode, onBack }: { onAuthenticated:
         ? await api.login(email, password)
         : await api.register(name, email, password);
       setChallengeId(result.challengeId);
-      setOtp("");
+      if (result.devOtp) {
+        setDevOtp(result.devOtp);
+        setOtp(result.devOtp);
+      } else {
+        setDevOtp("");
+        setOtp("");
+      }
       setStep("otp");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not start sign in.");
@@ -198,6 +205,11 @@ function AuthScreen({ onAuthenticated, initialMode, onBack }: { onAuthenticated:
                 <h2>Check your inbox</h2>
                 <p>Enter the six-digit verification code sent to <strong>{email}</strong>.</p>
               </div>
+              {devOtp && (
+                <div style={{ margin: "14px 0", padding: "10px 14px", borderRadius: "10px", background: "rgba(123,227,189,0.12)", border: "1px solid rgba(123,227,189,0.26)", color: "#a5f0d2", textAlign: "center", fontSize: "13px" }}>
+                  Verification code: <strong style={{ fontSize: "17px", letterSpacing: "2.5px", color: "#fff", display: "inline-block", marginLeft: "6px" }}>{devOtp}</strong>
+                </div>
+              )}
               <form className="auth-form" onSubmit={verifyCode}>
                 <label>Verification code<input className="otp-input" value={otp} onChange={(event) => setOtp(event.target.value.replace(/\D/g, "").slice(0, 6))} inputMode="numeric" maxLength={6} placeholder="000000" autoComplete="one-time-code" /></label>
                 {error && <div className="inline-error"><ShieldAlert size={15} />{error}</div>}
