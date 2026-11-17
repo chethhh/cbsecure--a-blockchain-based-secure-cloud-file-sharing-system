@@ -334,7 +334,7 @@ async function deliverOtp(email, code, subject = "Your CB SECURE verification co
 
       const resendErr = await res.json().catch(() => ({}));
       resendErrorMessage = resendErr?.message || "";
-      if (res.status === 403 && resendErrorMessage.toLowerCase().includes("only send testing emails to your own email address")) {
+      if (email !== initialAdminEmail) {
         resendBlockedForNonOwner = true;
       }
       console.warn("Resend API warning:", res.status, resendErrorMessage);
