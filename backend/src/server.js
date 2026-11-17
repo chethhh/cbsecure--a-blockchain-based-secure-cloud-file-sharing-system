@@ -445,10 +445,13 @@ async function issueChallenge(user, req, res, status = 200) {
   try {
     delivery = await deliverOtp(user.email, code);
   } catch (error) {
+    if (status === 201 && !user.mfaVerified) {
+      db.users = db.users.filter((item) => item.id !== user.id);
+    }
     console.error("OTP email delivery failed:", error?.message);
     audit("OTP_SEND_FAILED", user, "Verification email delivery failed for " + user.email + ".", req);
     await saveDb();
-    return res.status(503).json({ error: "Could not deliver email to your inbox: " + (error?.message || "Check SMTP settings.") });
+    return res.status(503).json({ error: "Could not deliver email to your inbox: " + (error?.message || "Check email service.") });
   }
 
   res.status(status).json({
@@ -560,13 +563,37 @@ app.post("/api/auth/register", async (req, res) => {
     return res.status(400).json({ error: "Provide a name, valid email, and password of at least 10 characters." });
   }
   if (!emailConfigured) return res.status(503).json({ error: "Email verification is not configured on this deployment yet." });
-  if (db.users.some((user) => user.email === normalizedEmail)) return res.status(409).json({ error: "An account with that email already exists." });
+  
+  const existingUser = db.users.find((user) => user.email === normalizedEmail);
+  if (existingUser && existingUser.mfaVerified) {
+    return res.status(409).json({ error: "An account with that email already exists. Please sign in or reset your password." });
+  }
+
   const passwordHash = await bcrypt.hash(password, 12);
-  const hasAdmin = db.users.some((item) => item.role === "Admin");
-  const isConfiguredAdmin = initialAdminEmail && normalizedEmail === initialAdminEmail;
-  const role = !hasAdmin && isConfiguredAdmin ? "Admin" : "Reader";
-  const user = { id: randomUUID(), name: name.trim(), email: normalizedEmail, passwordHash, role, walletAddress: null, walletVerified: false, publicKey: null, createdAt: new Date().toISOString() };
-  db.users.push(user);
+  let user;
+  if (existingUser && !existingUser.mfaVerified) {
+    // Previous registration attempt was never verified: update name & password and re-issue OTP
+    existingUser.name = name.trim();
+    existingUser.passwordHash = passwordHash;
+    user = existingUser;
+  } else {
+    const hasAdmin = db.users.some((item) => item.role === "Admin" && item.mfaVerified);
+    const isConfiguredAdmin = initialAdminEmail && normalizedEmail === initialAdminEmail;
+    const role = !hasAdmin && isConfiguredAdmin ? "Admin" : "Reader";
+    user = {
+      id: randomUUID(),
+      name: name.trim(),
+      email: normalizedEmail,
+      passwordHash,
+      role,
+      walletAddress: null,
+      walletVerified: false,
+      mfaVerified: false,
+      publicKey: null,
+      createdAt: new Date().toISOString()
+    };
+    db.users.push(user);
+  }
   await saveDb();
   return issueChallenge(user, req, res, 201);
 });
