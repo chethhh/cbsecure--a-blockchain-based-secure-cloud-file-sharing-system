@@ -46,6 +46,7 @@ const initialAdminEmail = String(process.env.INITIAL_ADMIN_EMAIL || "").trim().t
 const googleClientId = String(process.env.GOOGLE_CLIENT_ID || "").trim();
 const googleClient = googleClientId ? new OAuth2Client(googleClientId) : null;
 const smtpConfigured = Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+const emailConfigured = smtpConfigured || Boolean(process.env.RESEND_API_KEY) || Boolean(process.env.BREVO_API_KEY);
 const databaseUrl = process.env.NETLIFY_DB_URL || process.env.DATABASE_URL || process.env.POSTGRES_URL || "";
 
 if (!isServerless && jwtSecret.length < 32) throw new Error("Set JWT_SECRET to a random value with at least 32 characters.");
@@ -140,7 +141,7 @@ function deployedConfigurationIssues() {
     isCloudRun && !firestoreStateRef && "Firestore database",
     jwtSecret.length < 32 && "JWT_SECRET",
     !initialAdminEmail && "INITIAL_ADMIN_EMAIL",
-    isServerless && !smtpConfigured && "SMTP_HOST / SMTP_USER / SMTP_PASS",
+    isServerless && !emailConfigured && "Email delivery provider",
     isFunctionPlatform && !privateBlobConfigured && "Private Blob storage connection",
     isCloudRun && !cloudStorage && "GCS_BUCKET",
   ].filter(Boolean);
@@ -311,15 +312,58 @@ function createOtp() {
 }
 
 async function deliverOtp(email, code) {
-  if (!smtpConfigured) throw new Error("Email verification is unavailable. Configure SMTP_HOST, SMTP_USER, and SMTP_PASS.");
+  if (process.env.RESEND_API_KEY) {
+    try {
+      const res = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer " + process.env.RESEND_API_KEY,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: process.env.EMAIL_FROM || "CB SECURE <onboarding@resend.dev>",
+          to: [email],
+          subject: "Your CB SECURE verification code",
+          text: "Your one-time verification code is " + code + ". It expires in five minutes.",
+        }),
+      });
+      if (res.ok) return;
+      console.warn("Resend API delivery failed, trying SMTP fallback...");
+    } catch (err) {
+      console.warn("Resend error:", err?.message);
+    }
+  }
+
+  if (process.env.BREVO_API_KEY) {
+    try {
+      const res = await fetch("https://api.brevo.com/v3/smtp/email", {
+        method: "POST",
+        headers: {
+          "api-key": process.env.BREVO_API_KEY,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          sender: { name: "CB SECURE", email: process.env.SMTP_USER || "cbsecure@gmail.com" },
+          to: [{ email }],
+          subject: "Your CB SECURE verification code",
+          textContent: "Your one-time verification code is " + code + ". It expires in five minutes.",
+        }),
+      });
+      if (res.ok) return;
+    } catch (err) {
+      console.warn("Brevo error:", err?.message);
+    }
+  }
+
+  if (!smtpConfigured) throw new Error("Email delivery is unavailable. Configure SMTP_HOST/SMTP_USER/SMTP_PASS or RESEND_API_KEY.");
   const transport = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT || 587),
     secure: Number(process.env.SMTP_PORT || 587) === 465,
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-    connectionTimeout: 3500,
-    greetingTimeout: 3500,
-    socketTimeout: 4000,
+    connectionTimeout: 8000,
+    greetingTimeout: 8000,
+    socketTimeout: 10000,
   });
   await transport.sendMail({
     from: process.env.SMTP_FROM || { name: "CB SECURE", address: process.env.SMTP_USER || "cbsecure@gmail.com" },
@@ -348,24 +392,18 @@ async function issueChallenge(user, req, res, status = 200) {
   console.log(`[CB SECURE OTP] Code for ${user.email}: ${code}`);
   console.log("==================================================");
 
-  let emailSent = false;
-  if (smtpConfigured) {
-    try {
-      await deliverOtp(user.email, code);
-      emailSent = true;
-    } catch (error) {
-      console.warn("SMTP delivery attempt timed out/blocked by host firewall:", error?.message);
-      audit("OTP_SEND_FAILED", user, "Verification email delivery failed for " + user.email + ".", req);
-      await saveDb();
-    }
+  try {
+    await deliverOtp(user.email, code);
+  } catch (error) {
+    console.error("OTP email delivery failed:", error?.message);
+    audit("OTP_SEND_FAILED", user, "Verification email delivery failed for " + user.email + ".", req);
+    await saveDb();
+    return res.status(503).json({ error: "Could not deliver email to your inbox: " + (error?.message || "Check SMTP settings.") });
   }
 
   res.status(status).json({
     challengeId: challenge.id,
-    message: emailSent
-      ? "Enter the six-digit code sent to your email."
-      : "Enter your verification code to continue.",
-    devOtp: code,
+    message: "Enter the six-digit code sent to your email inbox.",
   });
 }
 
@@ -443,7 +481,7 @@ for (const method of ["get", "post", "put", "patch", "delete"]) {
 }
 
 app.get("/api/health", (_req, res) => {
-  const missing = [...deployedConfigurationIssues(), ...(!smtpConfigured && isRender ? ["Email delivery provider (SMTP)"] : [])];
+  const missing = [...deployedConfigurationIssues(), ...(!emailConfigured && isRender ? ["Email delivery provider (SMTP or Resend/Brevo)"] : [])];
   res.json({
     status: missing.length ? "setup_required" : "ok",
     missing,
@@ -453,7 +491,7 @@ app.get("/api/health", (_req, res) => {
       sha256: true,
       database: Boolean(databasePool),
       durableMetadata: Boolean(databasePool),
-      emailOtp: smtpConfigured,
+      emailOtp: emailConfigured,
       privateBlobStorage: privateBlobConfigured,
       directUploads: privateBlobConfigured,
       durableFileStorage: Boolean(process.env.PINATA_JWT || privateBlobConfigured),
@@ -469,7 +507,7 @@ app.post("/api/auth/register", async (req, res) => {
   if (!name?.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail) || !password || password.length < 10) {
     return res.status(400).json({ error: "Provide a name, valid email, and password of at least 10 characters." });
   }
-  if (!smtpConfigured) return res.status(503).json({ error: "Email verification is not configured on this deployment yet." });
+  if (!emailConfigured) return res.status(503).json({ error: "Email verification is not configured on this deployment yet." });
   if (db.users.some((user) => user.email === normalizedEmail)) return res.status(409).json({ error: "An account with that email already exists." });
   const passwordHash = await bcrypt.hash(password, 12);
   const hasAdmin = db.users.some((item) => item.role === "Admin");
@@ -490,7 +528,7 @@ app.post("/api/auth/login", async (req, res) => {
     await saveDb();
     return res.status(401).json({ error: "Email or password is incorrect." });
   }
-  if (!smtpConfigured) return res.status(503).json({ error: "Email verification is not configured on this deployment yet." });
+  if (!emailConfigured) return res.status(503).json({ error: "Email verification is not configured on this deployment yet." });
   return issueChallenge(user, req, res);
 });
 
